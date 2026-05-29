@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.venv_nightly/
+venv/
+
+# Training artifacts
+checkpoints/
+*.log
+*.zip
+*.exe
+*.npy
+
+# Dataset
+datasets/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Git submodule (not a real submodule, just embedded)
+mamba3/Mamba\ Based/

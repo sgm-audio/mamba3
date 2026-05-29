@@ -1,0 +1,10 @@
+.venv/
+.venv_nightly/
+venv/
+__pycache__/
+*.pyc
+checkpoints/
+*.log
+*.zip
+*.exe
+Mamba Based/
