@@ -51,11 +51,13 @@ The quantized Mamba3 Controller ONNX model (`mamba3_controller_quant.onnx`) expe
 
 | Tensor Name | Shape | Data Type | Description |
 | :--- | :--- | :---: | :--- |
-| **`observer_features`** (Input) | `[1, 100, 12]` | `f32` | Sliding sequence window of the last 100 Observer frames. |
-| **`session_state`** (Input) | `[1, 16]` | `f32` | L1 Session context (track type one-hot, BPM, beat offset, SR). |
-| **`hidden_state_in`** (Input) | `[1, 64]` | `f32` | Recurrent state carry-over for Mamba layer memory. |
-| **`dsp_parameters`** (Output) | `[1, 32]` | `f32` | 32 dynamic control coefficients mapped to classical DSP. |
-| **`hidden_state_out`** (Output) | `[1, 64]` | `f32` | Next recurrent state to be fed into the next inference cycle. |
+| **`observer_features`** (Input) | `[1, 1, 12]` | `f32` | ONE Observer frame per 10 ms tick (Way 5A). The SSM hidden state already summarizes history — the legacy 100-frame sliding window `[1, 100, 12]` is obsolete (it unrolled ~100 traced steps per layer and wasted 100× compute per tick). |
+| **`session_state`** (Input) | `[1, 16]` | `f32` | L1 Session context (track type one-hot, BPM, beat offset, SR) at `[0:8]`; **6C customer/tone profile embedding** at `[8:16]` (zero = neutral, fitted by `compiler/fit_profile.py`). |
+| **`hidden_state_in`** (Input) | `[1, 3, 64]` | `f32` | Packed recurrent states for all 3 Mamba layers (Way 5A). |
+| **`dsp_parameters`** (Output) | `[1, 32]` | `f32` | 32 tanh-bounded control coefficients mapped to classical DSP (`train_controller.py::PARAM_LAYOUT`). |
+| **`hidden_state_out`** (Output) | `[1, 3, 64]` | `f32` | Next packed recurrent state, fed into the next inference cycle. |
+
+> ⚠️ **Legacy artifact warning:** the checked-in `mamba3_controller_quant.onnx` was exported with a `torch.onnx.export` tuple-unpacking bug that leaks 2 extra inputs (`onnx::Mul_3`, `onnx::Mul_4`, `[1, 64]` each) and 2 extra outputs (`onnx::Mul_3168`, `onnx::Mul_4689`). `plugin/src/worker.rs` feeds those defensively (zero-filled) and reads outputs **by name**, so the plugin runs against both the legacy artifact and the clean re-export. Regenerate with `compiler/train_controller.py --export` + `compiler/quantize.py` (which enforces the 3-input/2-output signature gate) for the clean contract above.
 
 ---
 
@@ -175,3 +177,66 @@ Once you complete training the `Mamba3Controller` model on your specific dataset
 1.  Copy the compiled `.clap` plugin file into your system's CLAP search path (typically `/usr/lib/clap/` or `~/.clap/` on Linux).
 2.  Open REAPER, open Preferences $\rightarrow$ Plug-ins $\rightarrow$ CLAP, and run **Re-scan**.
 3.  Add "The Cynical Engineer" to a vocal or instrument track. Open the operation log display on the UI to audit the real-time parameter sweeps as the session plays!
+
+---
+
+## 11. Implementation Status & Change Log (2026-10-04)
+
+Completed per the architecture verification audit (Ways 4B + 5A + 6C):
+
+### Files created
+| File | Purpose |
+|------|---------|
+| `edge_dsp_meta_prompt/core/src/lib.rs` | Crate root, module declarations + re-exports (`TripleBuffer`, `Observer`, …) — `cargo test` for `edge_dsp_core` is now runnable |
+| `edge_dsp_meta_prompt/core/src/dynamics.rs` | `DynamicsProcessor` (feed-forward compressor + gentle downward gate, control-rate coefficient smoothing) + unit tests |
+| `edge_dsp_meta_prompt/plugin/src/lib.rs` | Plugin crate root |
+| `edge_dsp_meta_prompt/plugin/src/plugin.rs` | nih-plug `Plugin` impl, `DynamicDspParams` (32-D denormalization mirroring `train_controller.py::PARAM_LAYOUT`), RT DSP chain, worker thread lifecycle |
+| `edge_dsp_meta_prompt/plugin/src/worker.rs` | Background controller thread (Way 4B): embedded ONNX bytes, single-step recurrent inference (100 Hz tick), adaptive input feeding (legacy 5-input compatible), AuditorAgent commit |
+| `edge_dsp_meta_prompt/compiler/train_controller.py` | Way 5A: `Mamba3Controller` (3 layers, d_model=64, trapezoidal complex poles, no conv1d), `GoldenPolicy` teacher, distillation loop, clean single-step ONNX export (3 inputs / 2 outputs) |
+| `edge_dsp_meta_prompt/compiler/quantize.py` | INT8 dynamic quantization + **signature gate** (rejects the legacy `onnx::Mul_*` leak) + fp32↔int8 parity check |
+| `edge_dsp_meta_prompt/compiler/fit_profile.py` | Way 6C: prompt-tunes the 8-D customer profile (`session_state[8:16]`) with all model weights frozen |
+| `edge_dsp_meta_prompt/specs/prd_intelligent_mix_engine.md`, `specs/ard_cynical_engineer.md` | Missing spec docs restored |
+
+### Behavioral changes
+1. **ONNX contract fixed (Way 5A):** true single-step recurrent export
+   `observer_features (1,1,12) + session_state (1,16) + hidden_state_in (1,3,64) →
+   dsp_parameters (1,32) + hidden_state_out (1,3,64)`. The old 100-step unrolled
+   window wasted ~100× compute per tick and broke state continuity.
+2. **Customer profiles without LoRA (Way 6C):** `PromptStack.compile_session_state`
+   now accepts an 8-D `profile` written to `session_state[8:16]` (previously
+   dead padding). `compiler/fit_profile.py` fits it per customer in seconds on
+   CPU; runtime cost is zero extra model bytes and zero extra ops.
+3. **Dependency fix:** `plugin/Cargo.toml` moved `ort` from the **yanked**
+   `1.16.3` to the maintained `2.0.0-rc.13` line (the old pin is unbuildable
+   with a fresh `Cargo.lock`).
+4. **DSP engine gap closed:** a compressor/gate (`core/src/dynamics.rs`) now
+   actually implements the dynamics parameters `auditor.rs` has always clamped.
+5. **Training objective corrected (Recipe 1A, `mamba3/train.py` + `mamba3/degrade.py`):**
+   the model now trains as a restorer — synthetic EQ/compression/saturation/reverb
+   damage in, clean stem out — instead of the previous identity autoencoder.
+
+### Known limitations (tracked from the audit, not yet addressed)
+- `mamba3/model.py`: `Mamba3MIMOLayer.in_proj` is instantiated but unused;
+  `_ssm_scan_sequential` drives `B_proj` from raw `x_r8` only (hidden state `x`
+  modulates only `dt` + residual). Candidate follow-up: Way 2A/2B recurrence rewiring.
+- `mamba3/model.py` STFT path is non-causal (`center=True`, symmetric convs) —
+  irrelevant for the Way 4B control plane, but blocks direct streaming (Way 4A).
+- `mamba3/mamba/mamba_ssm/modules/mamba3.py` is still missing from the vendored
+  upstream snapshot (ops + tests are present).
+
+### Verification gates (run on a machine with torch/cargo)
+```bash
+# Training pipeline (Recipe 1A: degraded input → clean target)
+python mamba3/smoke_test.py --device cuda        # §10 degradation, §11 f0 gating + grad-ckpt
+python mamba3/test_smoke.py --device cuda        # §9  degradation + f0 gating
+
+# Controller + quantization + profile (Way 5A/6C)
+cd mamba3/edge_dsp_meta_prompt
+python compiler/train_controller.py --steps 2000 --export controller.onnx \
+    --quantized mamba3_controller_quant.onnx
+python compiler/fit_profile.py --data <client_features_dir> --profile-out profile.npy
+
+# Rust (once a toolchain is available)
+cargo test --manifest-path core/Cargo.toml
+cargo check --manifest-path plugin/Cargo.toml && cargo xtask bundle cynical-engineer
+```

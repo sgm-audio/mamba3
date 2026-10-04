@@ -689,6 +689,52 @@ def test_memory_scaling(dev: torch.device):
         print(f"    → reduce: --d-model 64 --d-state 8 --batch 2")
 
 
+# ── section 9: Recipe 1A degradation + f0 gating ───────────────────────────
+
+def test_degrade_gating(dev: torch.device):
+    """Recipe 1A (degrade → clean) pipeline sanity + target_pitched f0 gating."""
+    from degrade import StemDegradation
+
+    sr = 44100
+    L = sr // 2
+    t = torch.arange(L, device=dev, dtype=torch.float32) / sr
+    wav = (0.4 * torch.sin(2 * 3.14159265 * 220.0 * t)).view(1, 1, L)
+
+    full = StemDegradation(sample_rate=sr, seed=11,
+                           p_eq=1.0, p_comp=1.0, p_sat=1.0, p_reverb=1.0)
+    y = full(wav)
+    check(y.shape == wav.shape, f"degrade keeps shape {tuple(y.shape)}")
+    check(bool(torch.isfinite(y).all()), "degrade output finite")
+    rms_ratio = y.pow(2).mean().sqrt().item() / wav.pow(2).mean().sqrt().item()
+    check(0.25 <= rms_ratio <= 4.0, f"degrade RMS ratio sane ({rms_ratio:.3f})")
+    full.reseed(11)
+    y2 = full(wav)
+    full.reseed(11)
+    y2 = full(wav)
+    check(torch.allclose(y, y2), "degrade deterministic under reseed()")
+
+    # f0 gating: target_pitched=0 must make CREPE irrelevant
+    cfg = _CFG
+    model = PerTrackProcessor(cfg).to(dev).eval()
+    T = stft_frames(L, cfg.hop_length)
+    c1 = torch.softmax(torch.randn(1, T, 360, device=dev), dim=-1)
+    c2 = torch.softmax(torch.randn(1, T, 360, device=dev), dim=-1)
+    zero = torch.zeros(1, device=dev)
+    one = torch.ones(1, device=dev)
+    wav1 = wav.reshape(1, L)
+    with torch.no_grad():
+        d0 = (model(wav1, c1, target_pitched=zero)['output_stft']
+              - model(wav1, c2, target_pitched=zero)['output_stft']).abs().max().item()
+        d1 = (model(wav1, c1, target_pitched=one)['output_stft']
+              - model(wav1, c2, target_pitched=one)['output_stft']).abs().max().item()
+    check(d0 == 0.0, f"pitched=0 zeroes f0 pathway exactly (diff {d0:.2e})")
+    check(d1 > 0.0, f"pitched=1 lets f0 through (diff {d1:.2e})")
+
+    del model, y, y2, c1, c2
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 # ── summary ────────────────────────────────────────────────────────────────
 
 def print_summary(results: dict[str, bool]):
@@ -756,6 +802,7 @@ def main():
     maybe("6", "Forward + backward",          lambda: test_forward_backward(dev))
     maybe("7", "Gradient checkpointing",      lambda: test_grad_checkpointing(dev))
     maybe("8", "Memory scaling (batch=4×4s)", lambda: test_memory_scaling(dev))
+    maybe("9", "Recipe 1A degrade + f0 gating", lambda: test_degrade_gating(dev))
 
     print_summary(results)
 

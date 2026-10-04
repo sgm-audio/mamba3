@@ -261,6 +261,12 @@ class Mamba3MIMOLayer(nn.Module):
         self.norm     = nn.LayerNorm(cfg.d_model)
         self.drop     = nn.Dropout(cfg.dropout)
 
+        # --- Activation-memory control (honored by forward; set by train.py) ---
+        # When True during training, the layer body is wrapped in
+        # torch.utils.checkpoint (non-reentrant) so activations are recomputed
+        # in backward instead of stored. ~20% slower, much lower peak VRAM.
+        self.gradient_checkpointing = False
+
         # --- FiLM conditioning projections (eagerly initialized) ---
         # Initialized so γ ≈ 0, β ≈ 0 → layer starts as identity in cond pathway.
         # This is the standard FiLM init trick: model behaves as plain Mamba3
@@ -362,6 +368,29 @@ class Mamba3MIMOLayer(nn.Module):
         return out
 
     def forward(
+        self,
+        x: Tensor,           # (B, T, d_model) — track embedding
+        x_r8: Tensor,        # (B, T, R=8) — raw structured features (MIMO input)
+        cond: Optional[Tensor] = None,  # (B, T, d_cond) — FiLM conditioning
+    ) -> Tensor:
+        """
+        Returns: (B, T, d_model)
+
+        If ``self.gradient_checkpointing`` is True and gradients are enabled,
+        the body runs under ``torch.utils.checkpoint.checkpoint`` so training
+        recomputes activations in backward instead of storing them (set
+        ``layer.gradient_checkpointing = True`` from the training loop; the
+        ``--no-grad-ckpt`` CLI flag disables it).
+        """
+        if self.training and self.gradient_checkpointing and torch.is_grad_enabled():
+            # cond may be None; non-tensor args pass through non-reentrant
+            # checkpointing unchanged.
+            return torch.utils.checkpoint.checkpoint(
+                self._forward_impl, x, x_r8, cond, use_reentrant=False
+            )
+        return self._forward_impl(x, x_r8, cond)
+
+    def _forward_impl(
         self,
         x: Tensor,           # (B, T, d_model) — track embedding
         x_r8: Tensor,        # (B, T, R=8) — raw structured features (MIMO input)
@@ -676,6 +705,7 @@ class PerTrackProcessor(nn.Module):
         waveform: Tensor,               # (B, L) — target track
         crepe_probs: Tensor,            # (B, T, 360) — f0 (pre-resampled)
         other_embs: Optional[Tensor] = None,   # (B, K, T, d_semantic)
+        target_pitched: Optional[Tensor] = None,  # (B,) float 0/1 — gates f0 in FiLM
     ) -> dict:
         """
         Returns dict with:
@@ -699,6 +729,13 @@ class PerTrackProcessor(nn.Module):
 
         # --- F0 conditioning ---
         f0_emb = self.f0_conditioner(crepe_probs)               # (B, T, d_f0)
+        # Gate f0 contribution for unpitched stems (drums/other): the CREPE
+        # vector is all zeros there, but F0Conditioner's biases/LayerNorm would
+        # still inject a non-zero f0 embedding. target_pitched (0.0/1.0, from
+        # <stem>.pitched.npy) zeroes that pathway exactly.
+        if target_pitched is not None:
+            gate = target_pitched.to(f0_emb.dtype).reshape(-1, 1, 1)  # (B, 1, 1)
+            f0_emb = f0_emb * gate
 
         # --- Cross-track aggregation ---
         if other_embs is not None:

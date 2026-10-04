@@ -9,7 +9,11 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 edge_dsp_core = { path = "../core" }
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_no_alloc"] }
-ort = { version = "1.16.3", features = ["load-dynamic"] }
+# NOTE: the previously pinned ort 1.16.3 is YANKED on crates.io (unbuildable).
+# Updated to the current maintained line (ONNX Runtime 1.28 wrapper); the
+# worker targets the 2.0-rc session/value API. `load-dynamic` dlopens the ORT
+# shared library at runtime (ORT_DYLIB_PATH or a dylib shipped with the plugin).
+ort = { version = "2.0.0-rc.13", features = ["load-dynamic", "ndarray"] }
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.114"
 lazy_static = "1.4.0"

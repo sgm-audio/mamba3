@@ -537,7 +537,7 @@ def test_gradient_checkpointing(dev: torch.device, model: PerTrackProcessor, cfg
     crepe_probs = torch.softmax(torch.randn(B, T, 360, device=dev), dim=-1)
     other_embs = torch.randn(B, K, T, cfg.d_semantic, device=dev)
 
-    for layer in model.mamba_layers:
+    for layer in list(model.mamba_layers) + list(model.semantic_enc.mamba_layers):
         layer.gradient_checkpointing = True
 
     model.train()
@@ -565,7 +565,7 @@ def test_gradient_checkpointing(dev: torch.device, model: PerTrackProcessor, cfg
     except Exception as e:
         check(False, f"Gradient checkpointing fwd+bwd ({type(e).__name__}: {e})")
 
-    for layer in model.mamba_layers:
+    for layer in list(model.mamba_layers) + list(model.semantic_enc.mamba_layers):
         layer.gradient_checkpointing = False
 
     model.zero_grad(set_to_none=True)
@@ -713,6 +713,132 @@ def test_rocm_env():
 
 
 # ---------------------------------------------------------------------------
+# [10] Recipe 1A: synthetic degradation pipeline
+# ---------------------------------------------------------------------------
+
+def test_degradation(dev: torch.device, cfg: TrackProcessorConfig):
+    print(f"\n{'='*60}")
+    print("[10] Recipe 1A degradation (EQ/comp/sat/reverb → clean target)")
+    print(f"{'='*60}")
+
+    from degrade import StemDegradation
+
+    sr = cfg.sample_rate
+    clip_len = sr * 1
+    B, C = 2, 1
+
+    # Sine + noise: known energy, tests RMS preservation
+    t = torch.arange(clip_len, device=dev, dtype=torch.float32) / sr
+    wav = 0.5 * torch.sin(2 * math.pi * 440.0 * t)
+    wav = wav + 0.02 * torch.randn(clip_len, device=dev)
+    wav = wav.unsqueeze(0).unsqueeze(0).expand(B, C, clip_len).contiguous()
+
+    degrade = StemDegradation(sample_rate=sr, seed=42)
+
+    # Force every op on (probability 1.0) via a copy with p=1
+    full = StemDegradation(sample_rate=sr, seed=42,
+                           p_eq=1.0, p_comp=1.0, p_sat=1.0, p_reverb=1.0)
+    out = full(wav)
+
+    check(out.shape == wav.shape, f"degrade: shape preserved {tuple(out.shape)}")
+    check(bool(torch.isfinite(out).all()), "degrade: output finite (no NaN/Inf)")
+    check(out.abs().max().item() < 20.0,
+          f"degrade: output bounded (max {out.abs().max().item():.3f})")
+
+    rms_in  = wav.pow(2).mean().sqrt().item()
+    rms_out = out.pow(2).mean().sqrt().item()
+    rms_ratio = rms_out / max(rms_in, 1e-8)
+    check(0.25 <= rms_ratio <= 4.0,
+          f"degrade: RMS roughly preserved (ratio {rms_ratio:.3f})")
+
+    # Determinism: same seed → identical output
+    a = full(wav)
+    full.reseed(42)
+    b = full(wav)
+    full.reseed(42)
+    b = full(wav)
+    check(torch.allclose(a, b), "degrade: reseed() gives deterministic output")
+
+    # Single-op smoke: each op alone stays finite
+    for op in ('p_eq', 'p_comp', 'p_sat', 'p_reverb'):
+        kwargs = dict(p_eq=0.0, p_comp=0.0, p_sat=0.0, p_reverb=0.0)
+        kwargs[op] = 1.0
+        one = StemDegradation(sample_rate=sr, seed=7, **kwargs)
+        y = one(wav)
+        check(bool(torch.isfinite(y).all()), f"degrade: {op} finite")
+        check(y.shape == wav.shape, f"degrade: {op} shape preserved")
+
+    # Scalar (L,) and stereo (C, L) shapes must also work
+    y1 = full(wav[0, 0])
+    y2 = full(wav[0])
+    check(y1.shape == wav[0, 0].shape, "degrade: (L,) shape preserved")
+    check(y2.shape == wav[0].shape, "degrade: (C, L) shape preserved")
+
+    del wav, out, a, b, y1, y2
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# [11] f0 pitched gating + native gradient-checkpointing flag
+# ---------------------------------------------------------------------------
+
+def test_pitched_gating(dev: torch.device, model: PerTrackProcessor, cfg: TrackProcessorConfig):
+    print(f"\n{'='*60}")
+    print("[11] f0 pitched gating (target_pitched) + grad-ckpt flag honored")
+    print(f"{'='*60}")
+
+    sr = cfg.sample_rate
+    clip_len = sr // 2
+    B = 1
+    T = t_frames(clip_len, cfg)
+
+    wav = 0.3 * torch.randn(B, clip_len, device=dev)
+    crepe_a = torch.softmax(torch.randn(B, T, 360, device=dev), dim=-1)
+    crepe_b = torch.softmax(torch.randn(B, T, 360, device=dev), dim=-1)
+    zero = torch.zeros(B, device=dev)
+    one  = torch.ones(B, device=dev)
+
+    model.eval()
+    with torch.no_grad():
+        out_a0 = model(wav, crepe_a, target_pitched=zero)['output_stft']
+        out_b0 = model(wav, crepe_b, target_pitched=zero)['output_stft']
+        out_a1 = model(wav, crepe_a, target_pitched=one)['output_stft']
+        out_b1 = model(wav, crepe_b, target_pitched=one)['output_stft']
+
+    # With target_pitched = 0 the f0 pathway must be exactly zeroed:
+    # different CREPE vectors cannot change the output.
+    diff0 = (out_a0 - out_b0).abs().max().item()
+    check(diff0 == 0.0, f"pitched=0: CREPE ignored exactly (max diff {diff0:.2e})")
+
+    # With target_pitched = 1 (or None) CREPE must influence the output.
+    diff1 = (out_a1 - out_b1).abs().max().item()
+    check(diff1 > 0.0, f"pitched=1: CREPE influences output (max diff {diff1:.2e})")
+
+    # Gradient checkpointing flag is honored in training mode:
+    # fwd+bwd must complete with the flag on, and produce grads.
+    for layer in list(model.mamba_layers) + list(model.semantic_enc.mamba_layers):
+        layer.gradient_checkpointing = True
+    model.train()
+    model.zero_grad(set_to_none=True)
+    try:
+        out = model(wav, crepe_a, target_pitched=one)
+        loss = out['output_stft'].abs().mean()
+        loss.backward()
+        n_grads = sum(1 for p in model.parameters() if p.grad is not None)
+        check(n_grads > 0, f"grad-ckpt flag: backward produced grads on {n_grads} tensors")
+    except Exception as e:
+        check(False, f"grad-ckpt flag: fwd+bwd ({type(e).__name__}: {e})")
+    for layer in list(model.mamba_layers) + list(model.semantic_enc.mamba_layers):
+        layer.gradient_checkpointing = False
+    model.zero_grad(set_to_none=True)
+
+    del wav, crepe_a, crepe_b, out_a0, out_b0, out_a1, out_b1
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -756,6 +882,8 @@ def smoke_test(device: str = 'cuda', verbose: bool = True, amp: bool = False):
     test_gradient_checkpointing(dev, model, cfg)
     test_memory_scaling(dev, model, cfg)
     test_rocm_env()
+    test_degradation(dev, cfg)
+    test_pitched_gating(dev, model, cfg)
 
     print(f"\n{'='*60}")
     print("SUMMARY")
