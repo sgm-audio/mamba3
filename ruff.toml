@@ -1,0 +1,11 @@
+# Minimal lint gate: correctness-only (pyflakes) rules. No style enforcement is
+# imposed on this codebase — add rule groups deliberately if/when wanted.
+line-length = 120
+target-version = "py310"
+
+extend-exclude = [
+    "mamba3/mamba/",            # vendored partial copy of state-spaces/mamba (not maintained here)
+]
+
+[lint]
+select = ["F"]

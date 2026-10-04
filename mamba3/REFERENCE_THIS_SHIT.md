@@ -1,6 +1,9 @@
 # MASTER REFERENCE GUIDE: Edge-Inference DSP Meta-Prompt Stack & CLAP Plugin Framework
 
-This document serves as the absolute quick-reference for the completed **Edge-Inference DSP Meta-Prompt Stack** and **CLAP/ARA Plugin Framework** codebase under `/home/sgm/Desktop/mamba3/edge_dsp_meta_prompt/`.
+This document serves as the quick-reference for the **Edge-Inference DSP Meta-Prompt Stack** and **CLAP Plugin Framework** codebase under `mamba3/edge_dsp_meta_prompt/` (paths below are relative to that directory).
+
+<!-- STATUS: in progress -->
+> **Status (review 2026-10-04):** the Python toolchain (`compiler/`) is runnable and tested; the Rust crates have **not been built in CI** (no `Cargo.lock`, `nih_plug` is a git dependency, `ort` is pinned to a 2.0 release candidate) and the committed ONNX artifact is the legacy one (see §2). Treat the Rust side as unverified until a `cargo build` is on record.
 
 ---
 
@@ -31,8 +34,10 @@ edge_dsp_meta_prompt/
 ├── compiler/ (Python: Prompt Stack & Exporter Toolchain)
 │   ├── requirements.txt
 │   ├── prompt_stack.py (5-Layer compiler structures)
-│   ├── train_controller.py (Mamba3Controller & dynamic losses)
-│   └── quantize.py (ONNX exporter & 8-bit dynamic quantizer)
+│   ├── train_controller.py (Mamba3Controller, GoldenPolicy distillation, ONNX export)
+│   ├── fit_profile.py (6C per-customer 8-D profile prompt-tuning)
+│   ├── quantize.py (INT8 dynamic quantizer + signature/parity gate)
+│   └── test_controller.py (regression tests: recurrence, state layout, ONNX round-trip)
 │
 └── specs/ (Product and Architectural Reference specifications)
     ├── prd_cynical_engineer.md
@@ -57,7 +62,7 @@ The quantized Mamba3 Controller ONNX model (`mamba3_controller_quant.onnx`) expe
 | **`dsp_parameters`** (Output) | `[1, 32]` | `f32` | 32 tanh-bounded control coefficients mapped to classical DSP (`train_controller.py::PARAM_LAYOUT`). |
 | **`hidden_state_out`** (Output) | `[1, 3, 64]` | `f32` | Next packed recurrent state, fed into the next inference cycle. |
 
-> ⚠️ **Legacy artifact warning:** the checked-in `mamba3_controller_quant.onnx` was exported with a `torch.onnx.export` tuple-unpacking bug that leaks 2 extra inputs (`onnx::Mul_3`, `onnx::Mul_4`, `[1, 64]` each) and 2 extra outputs (`onnx::Mul_3168`, `onnx::Mul_4689`). `plugin/src/worker.rs` feeds those defensively (zero-filled) and reads outputs **by name**, so the plugin runs against both the legacy artifact and the clean re-export. Regenerate with `compiler/train_controller.py --export` + `compiler/quantize.py` (which enforces the 3-input/2-output signature gate) for the clean contract above.
+> ⚠️ **Legacy artifact warning — the checked-in `mamba3_controller_quant.onnx` does NOT match this contract.** Inspected with onnxruntime (review 2026-10-04) it declares `observer_features [1, 100, 12]` (the old 100-frame window), `hidden_state_in [1, 64]` (one layer, not `[1, 3, 64]`), plus the leaked `onnx::Mul_3` / `onnx::Mul_4` inputs and `onnx::Mul_3168` / `onnx::Mul_4689` outputs from the tuple-unpacking export bug. `plugin/src/worker.rs` zero-fills unknown inputs and reads outputs by name, **but it fills `observer_features` with 12 floats and `hidden_state_in` with 192 floats regardless of the declared shape**, so `Tensor::from_array` fails on every tick against the legacy artifact and the plugin silently stays on neutral DSP parameters. The artifact must be regenerated before the plugin is useful: `python compiler/train_controller.py --steps 2000 --export controller.onnx --quantized mamba3_controller_quant.onnx` (the export path itself was broken until this review — see `compiler/test_controller.py`). <!-- STATUS: in progress -->
 
 ---
 
@@ -116,7 +121,7 @@ All compilation, model training simulations, and dynamic quantization passes mus
 
 *   **Initialize Virtual Environment**:
     ```bash
-    source /home/sgm/Desktop/mamba3/.venv/bin/activate
+    source .venv/bin/activate          # any venv with compiler/requirements.txt installed
     ```
 *   **Run Prompt Stack Compiler**:
     ```bash

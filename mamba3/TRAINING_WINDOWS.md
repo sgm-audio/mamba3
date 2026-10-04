@@ -156,7 +156,7 @@ cd $env:USERPROFILE\mamba3
 python test_smoke.py --device cuda
 ```
 
-Should complete 9/9 sections in ~60-90 seconds. If any section fails, do NOT proceed to training — fix the failure first.
+Should complete 10/10 sections in ~60-90 seconds. If any section fails, do NOT proceed to training — fix the failure first.
 
 ---
 
@@ -390,7 +390,8 @@ C:\Users\<you>\mamba3\
 ├── .venv\                    # Python virtual environment
 ├── model.py                  # Mamba-3 MIMO architecture
 ├── train.py                  # Training loop (resume/val/early-stop)
-├── test_smoke.py             # Pre-training smoke test (9 sections)
+├── test_smoke.py             # Reduced pre-training smoke test (10 sections)
+├── smoke_test.py             # Full pre-training smoke test (12 sections; what run_smoke_test.ps1 runs)
 ├── extract_crepe.py          # Offline CREPE f0 extraction
 ├── train.log                 # Training output (appended on resume)
 └── checkpoints\

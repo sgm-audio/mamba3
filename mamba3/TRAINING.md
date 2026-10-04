@@ -59,12 +59,12 @@ pip install torchcrepe
 ### 2.3 Pre-extract CREPE f0 for the entire dataset (~30-60 min):
 ```bash
 # Train set
-python extract_crepe.py --data ~/datasets/musdb18hq/train --device cuda --model large
+python extract_crepe.py --data ~/datasets/musdb18hq/train --device cuda --model full
 
 # Test set (held-out — optional but recommended for final eval)
-python extract_crepe.py --data ~/datasets/musdb18hq/test --device cuda --model large
+python extract_crepe.py --data ~/datasets/musdb18hq/test --device cuda --model full
 ```
-**Note:** Resumable — re-run anytime to skip already-extracted files.
+**Note:** Resumable — re-run anytime to skip already-extracted files. `--model` accepts only `tiny` or `full` (the sizes torchcrepe ships); `full` is the most accurate.
 
 ---
 
@@ -263,7 +263,9 @@ Acceptable for sequential SSM scan on iGPU. If it's > 60s consistently, reduce s
 ~/mamba3/
 ├── model.py                  # Mamba-3 MIMO architecture
 ├── train.py                  # Training loop with resume/val/early-stop
-├── test_smoke.py             # Pre-training smoke test (9 sections)
+├── test_smoke.py             # Reduced pre-training smoke test (10 sections)
+├── smoke_test.py             # Full pre-training smoke test (12 sections, incl. scan parity)
+├── degrade.py                # Recipe 1A synthetic degradation (EQ/comp/sat/reverb)
 ├── extract_crepe.py          # Offline CREPE f0 extraction
 ├── train.log                 # Training output (appended on resume)
 └── checkpoints/

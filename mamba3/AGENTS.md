@@ -6,7 +6,7 @@
 
 ## Setup order
 1. `env_314.ps1` — one-shot env setup (preferred). Installs Python 3.14→3.12 fallback, ROCm 7.13.0 gfx1152 wheels, all deps. Includes gates for Smart App Control, VC++ redist, GPU driver ≥31.x, username spaces.
-2. `run_smoke_test.ps1` — runs `smoke_test.py` (793 lines, 9 sections) before training.
+2. `run_smoke_test.ps1` — runs `smoke_test.py` (12 sections) before training.
 3. `extract_crepe.py` — offline CREPE f0 extraction, saves `.crepe.npy` + `.pitched.npy` per stem. Resumable.
 4. `run_train.ps1` — auto-detects latest checkpoint for resume.
 
@@ -25,8 +25,8 @@
 - Resume via `--resume checkpoints/checkpoint_XXXXXX.pt` (loads model+optimizer+scheduler+step). Checkpoints written atomically (`.tmp` → rename).
 
 ## Dual smoke tests
-- `smoke_test.py` (793 lines, 9 sections) — referenced and run by `run_smoke_test.ps1`
-- `test_smoke.py` (764 lines, fewer sections) — referenced by `TRAINING_WINDOWS.md`
+- `smoke_test.py` (12 sections) — referenced and run by `run_smoke_test.ps1`
+- `test_smoke.py` (10 sections) — run by `run_smoke_test.sh`, referenced by `TRAINING_WINDOWS.md`
 - Both exist. Scripts use `smoke_test.py`, docs reference `test_smoke.py`. Run `smoke_test.py`.
 
 ## Architecture

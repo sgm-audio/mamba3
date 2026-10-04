@@ -30,13 +30,9 @@ import sys
 import math
 import time
 import argparse
-import traceback
-from dataclasses import replace
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
 
 from model import (
     PerTrackProcessor,
@@ -658,7 +654,7 @@ def test_memory_scaling(dev: torch.device, model: PerTrackProcessor, cfg: TrackP
     if torch.cuda.is_available():
         vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
         print(f"\n  VRAM budget: {vram_total:.1f} GB total")
-        print(f"  Train recommendation: start with --batch 2 --d-model 128 --d-state 16")
+        print("  Train recommendation: start with --batch 2 --d-model 128 --d-state 16")
 
 
 # ---------------------------------------------------------------------------
@@ -732,8 +728,6 @@ def test_degradation(dev: torch.device, cfg: TrackProcessorConfig):
     wav = 0.5 * torch.sin(2 * math.pi * 440.0 * t)
     wav = wav + 0.02 * torch.randn(clip_len, device=dev)
     wav = wav.unsqueeze(0).unsqueeze(0).expand(B, C, clip_len).contiguous()
-
-    degrade = StemDegradation(sample_rate=sr, seed=42)
 
     # Force every op on (probability 1.0) via a copy with p=1
     full = StemDegradation(sample_rate=sr, seed=42,
@@ -901,7 +895,6 @@ def smoke_test(device: str = 'cuda', verbose: bool = True, amp: bool = False):
     warn_count = 0
 
     dev = torch.device(device if torch.cuda.is_available() else 'cpu')
-    actual_device = dev
 
     print(f"\n{'='*60}")
     print("Smoke Test: Mamba-3 MIMO Per-Track Processor")
@@ -946,14 +939,14 @@ def smoke_test(device: str = 'cuda', verbose: bool = True, amp: bool = False):
     print(f"  Warnings: {warn_count}")
     if fail_count == 0:
         print(f"\n  All checks {PASS}. Proceed to train.py with --device cuda")
-        print(f"  Recommended: python train.py --data <path> --device cuda --batch 2 --d-model 128 --d-state 16")
+        print("  Recommended: python train.py --data <path> --device cuda --batch 2 --d-model 128 --d-state 16")
     else:
         print(f"\n  {fail_count} check(s) {FAIL}. Review output above.")
     if warn_count > 0:
         print(f"  {warn_count} warning(s). May need attention before training.")
-    print(f"  If OOM: reduce --d-model 64 --d-state 8 --batch 1")
-    print(f"  If NaN: check bf16 AMP — disable with --no-amp first")
-    print(f"  If slow: sequential SSM scan is O(T) — expected on CPU/small GPU")
+    print("  If OOM: reduce --d-model 64 --d-state 8 --batch 1")
+    print("  If NaN: check bf16 AMP — disable with --no-amp first")
+    print("  If slow: sequential SSM scan is O(T) — expected on CPU/small GPU")
     print('='*60)
 
     return fail_count == 0

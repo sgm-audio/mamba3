@@ -4,13 +4,27 @@ __pycache__/
 .venv/
 .venv_nightly/
 venv/
+.ruff_cache/
+.pytest_cache/
 
 # Training artifacts
 checkpoints/
+*.pt
+*.pth
+*.tmp
 *.log
 *.zip
 *.exe
 *.npy
+
+# Edge-controller toolchain outputs (compiler/ — the committed plugin
+# artifact mamba3/edge_dsp_meta_prompt/mamba3_controller_quant.onnx is tracked)
+controller.onnx
+controller.onnx.data
+profile.json
+
+# Rust
+target/
 
 # Dataset
 datasets/

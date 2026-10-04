@@ -15,7 +15,8 @@ VENV_ACTIVATE="${SCRIPT_DIR}/.venv/bin/activate"
 # 1. Check for virtual environment
 if [ ! -f "${VENV_ACTIVATE}" ]; then
     echo "ERROR: Virtual environment not found at ${SCRIPT_DIR}/.venv"
-    echo "Please run './setup_env.sh' first to set up the environment."
+    echo "Create it first: python3 -m venv .venv && . .venv/bin/activate && pip install <ROCm torch wheel> && pip install -r requirements.txt"
+    echo "(see TRAINING_UBUNTU.md / TRAINING.md)"
     exit 1
 fi
 

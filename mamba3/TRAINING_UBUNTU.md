@@ -1,5 +1,15 @@
 # Mamba-3 Native Ubuntu Training Guide
 
+<!-- STATUS: in progress -->
+> **Status (review 2026-10-04): in progress.** This guide references `setup_env.sh` and
+> `extract_f0.sh`, which are **not in the repository** (only `run_smoke_test.sh` and
+> `run_train.sh` exist, and both expect a venv at `mamba3/.venv`). Until those scripts
+> are added, create the venv manually (`python3 -m venv .venv && . .venv/bin/activate`,
+> install the ROCm PyTorch wheel for your GPU, then `pip install -r requirements.txt`)
+> and run `python extract_crepe.py --data <musdb18hq>/train --device cuda --model full`
+> directly. The two launcher scripts also hard-code a personal dataset path
+> (`/media/sgm/bazzite/...`) — pass `--data <path>` to override.
+
 > **A simplified, high-performance training guide designed for native Ubuntu hosts running AMD GPUs (RDNA3/RDNA3.5, Radeon 860M) with optimized UMA buffer parameters.**
 
 This guide transitions the entire **Mamba-3 MIMO Audio Separator** training pipeline from complex containerized setups to simple native shell scripts. It references your native mounts and enforces a optimized **16 GB UMA buffer budget** to ensure thermal safety and prevent out-of-memory (OOM) crashes.
@@ -97,7 +107,7 @@ Sustained training on laptops demands vigilance regarding temperatures to preven
 
 ### "HIP error: invalid device function"
 * **Reason**: ROCm environment variables were lost or not loaded.
-* **Solution**: Always launch using our `./run_train.sh` or `./run_smoke_test.sh` scripts, which force-export `HSA_OVERRIDE_GFX_VERSION=11.0.3`, `PYTORCH_ROCM_ARCH=gfx1103`, and `HSA_ENABLE_SDMA=0` before running Python.
+* **Solution**: Always launch using our `./run_train.sh` or `./run_smoke_test.sh` scripts, which force-export `HSA_OVERRIDE_GFX_VERSION=11.0.0`, `PYTORCH_ROCM_ARCH=gfx1100`, and `HSA_ENABLE_SDMA=0` before running Python (these are the values the scripts actually set; they match `TRAINING.md` §1.3).
 
 ### iGPU Not Visible to PyTorch (`CUDA/ROCm Available: False` / running CPU-only)
 * **Reason**: On AMD APUs (Ryzen laptops with integrated Radeon 860M graphics), the KFD (Kernel Fusion Driver) interface must be enabled, display memory pinning conflicts resolved, IOMMU isolated, and system user groups verified.

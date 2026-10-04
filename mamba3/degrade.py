@@ -28,7 +28,6 @@ deterministic across checks — required for stable early stopping.
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
@@ -135,7 +134,10 @@ class StemDegradation:
             spike = self._rand(1, device=y.device, lo=6.0, hi=12.0).item()
             ctrl[:, idx] = ctrl[:, idx] + spike
 
-        # Interpolate control points over linear bin index (≈ log-freq warp)
+        # Interpolate control points over LINEAR bin index. (Not a log-frequency
+        # warp: the 7 control points are spaced evenly in Hz, so most of the
+        # curve's resolution lands above ~3 kHz. Good enough for augmentation;
+        # revisit if low-frequency EQ damage needs finer control.)
         gains_db = F.interpolate(ctrl.unsqueeze(1), size=n_bins,
                                  mode='linear', align_corners=True).squeeze(1)
         gains = torch.pow(10.0, gains_db / 20.0).to(torch.float32)

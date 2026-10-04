@@ -9,12 +9,19 @@
 //!            hidden_state_in (1,3,64)
 //!   outputs: dsp_parameters (1,32), hidden_state_out (1,3,64)
 //!
-//! Backward compatibility: the LEGACY `mamba3_controller_quant.onnx` export
-//! leaked extra unnamed inputs/outputs (`onnx::Mul_3`, `onnx::Mul_4`, ...) —
-//! a torch.onnx.export tuple-unpacking bug.  `run_step` feeds ANY extra input
-//! declared by the graph with zeros and reads outputs BY NAME, so the worker
-//! runs correctly against both the legacy artifact and the clean re-export
-//! produced by `compiler/train_controller.py --export`.
+//! Backward compatibility (CAVEAT): the LEGACY `mamba3_controller_quant.onnx`
+//! export leaked extra unnamed inputs/outputs (`onnx::Mul_3`, `onnx::Mul_4`, ...)
+//! — a torch.onnx.export tuple-unpacking bug.  `run_step` zero-fills any extra
+//! declared input and reads outputs BY NAME, which covers the leaked tensors.
+//! It does NOT cover the legacy artifact's different *shapes*: that graph
+//! declares `observer_features [1,100,12]` and `hidden_state_in [1,64]`, while
+//! this worker supplies 12 and 192 floats respectively, so
+//! `Tensor::from_array` errors on every tick and the plugin stays on neutral
+//! params (the error is swallowed by `if let Ok(..)` in `run_worker`).  The
+//! worker is therefore only correct against the clean 5A re-export from
+//! `compiler/train_controller.py --export` — regenerate the artifact.
+//! TODO(review 2026-10-04): validate declared shapes in `new()` and fail
+//! loudly instead of per-tick; surface `run_step` errors at least once.
 //!
 //! This file runs on a normal thread: allocation and locking are fine here.
 //! Nothing in this module may ever be called from `process()`.

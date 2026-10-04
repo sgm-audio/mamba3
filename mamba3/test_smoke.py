@@ -31,7 +31,6 @@ import time
 import argparse
 import traceback
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from contextlib import contextmanager
 from typing import Callable
@@ -83,11 +82,17 @@ def timed(label: str):
     print(f"    ⏱  {label}: {time.perf_counter()-t0:.3f}s")
 
 
+_section_check_failures = 0   # non-fatal check() failures in the current section
+
+
 def check(condition: bool, msg: str, fatal: bool = False) -> bool:
+    global _section_check_failures
     status = PASS if condition else FAIL
     print(f"    {status} {msg}")
-    if not condition and fatal:
-        raise AssertionError(f"Fatal check failed: {msg}")
+    if not condition:
+        _section_check_failures += 1
+        if fatal:
+            raise AssertionError(f"Fatal check failed: {msg}")
     return condition
 
 
@@ -98,10 +103,19 @@ def section(title: str):
 
 
 def run_section(label: str, fn: Callable) -> bool:
-    """Run a test section, catch and report exceptions without aborting suite."""
+    """Run a test section, catch and report exceptions without aborting suite.
+
+    A section FAILS if it raises OR if any non-fatal check() inside it failed
+    (previously a red ✗ check could still be summarised as a passed section).
+    """
+    global _section_check_failures
     section(label)
+    _section_check_failures = 0
     try:
         fn()
+        if _section_check_failures:
+            print(f"  {FAIL} {_section_check_failures} check(s) failed in this section")
+            return False
         return True
     except AssertionError as e:
         print(f"  {FAIL} FATAL: {e}")
@@ -125,6 +139,11 @@ def test_rocm_env():
       - rocminfo / hipconfig availability (optional, warn if absent)
     """
     cuda_ok = torch.cuda.is_available()
+    if _REQUESTED_DEVICE == 'cpu':
+        # Explicit CPU run (CI / laptop without ROCm): no GPU is not a failure.
+        print(f"    {WARN if not cuda_ok else PASS} torch.cuda.is_available() → {cuda_ok} "
+              f"(--device cpu requested; GPU checks skipped)")
+        return
     check(cuda_ok, f"torch.cuda.is_available() → {cuda_ok}")
 
     if cuda_ok:
@@ -180,9 +199,9 @@ def test_rocm_env():
 # ── section 1: model build ─────────────────────────────────────────────────
 
 _CFG = None   # populated in main, shared across sections
+_REQUESTED_DEVICE = 'cuda'   # --device as passed on the CLI (set in main)
 
 def test_build():
-    global _CFG
     cfg = _CFG
 
     with timed("model instantiation"):
@@ -419,8 +438,8 @@ def test_amp_bf16(dev: torch.device):
     mean_err = (mag_fp32 - mag_bf16).abs().mean().item()
     max_err  = (mag_fp32 - mag_bf16).abs().max().item()
 
-    check(not has_nan, f"bf16 output: no NaN")
-    check(not has_inf, f"bf16 output: no Inf")
+    check(not has_nan, "bf16 output: no NaN")
+    check(not has_inf, "bf16 output: no Inf")
     check(mean_err < 0.5,
           f"bf16 vs fp32 mean |Δmag|: {mean_err:.4f} (threshold 0.5)")
     check(max_err  < 5.0,
@@ -472,10 +491,23 @@ def test_forward_backward(dev: torch.device):
     nan_grads = [n for n, v in grad_norms.items() if v != v]
     zero_grads = [n for n, v in grad_norms.items() if v == 0.0]
 
+    # The whole conditioning pathway (semantic encoder, f0 conditioner,
+    # cond_mlp, mel_proj) only reaches the output through FiLM layers that are
+    # zero-initialised (identity at step 0), so their gradients are EXACTLY
+    # zero on the very first backward by design; they come alive once
+    # film_proj moves off zero. Exclude them from the dead-grad gate so it
+    # measures the core path (r8 extractor → Mamba stack → decoder) only.
+    FILM_GATED = ('semantic_enc.', 'f0_conditioner.', 'cond_mlp.', 'mel_proj.')
+    core_grads = {n: v for n, v in grad_norms.items() if not n.startswith(FILM_GATED)}
+    core_dead  = [n for n, v in core_grads.items() if v == 0.0]
+    print(f"    Zero-grad params total: {len(zero_grads)}/{len(grad_norms)} "
+          f"({len(zero_grads) - len(core_dead)} in the zero-init-FiLM-gated conditioning path — expected at init)")
+
     check(len(nan_grads) == 0, f"NaN gradients: {len(nan_grads)} params affected"
           + (f" → {nan_grads[:3]}" if nan_grads else ""))
-    check(len(zero_grads) < len(grad_norms) * 0.5,
-          f"Dead grads: {len(zero_grads)}/{len(grad_norms)} params zero")
+    check(len(core_dead) < max(1, len(core_grads)) * 0.5,
+          f"Dead grads on core path: {len(core_dead)}/{len(core_grads)} params zero"
+          + (f" → {core_dead[:3]}" if core_dead else ""))
 
     # Top-5 grad norms (useful for debugging exploding/vanishing)
     top5 = sorted(grad_norms.items(), key=lambda x: -x[1])[:5]
@@ -620,7 +652,7 @@ def test_grad_checkpointing(dev: torch.device):
     print(f"    VRAM saved by checkpointing: {saving_mb:.0f} MB")
 
     check(peak_ckpt <= peak_plain + 10,   # 10 MB tolerance
-          f"Checkpointing VRAM ≤ plain VRAM (+10 MB tolerance)")
+          "Checkpointing VRAM ≤ plain VRAM (+10 MB tolerance)")
 
     # Numerical check: outputs should be identical (same weights, same input)
     mag_plain = out_plain['output_stft'].abs().float().detach()
@@ -635,7 +667,7 @@ def test_grad_checkpointing(dev: torch.device):
         if p.grad is not None and torch.isnan(p.grad).any()
     ]
     check(len(nan_grads) == 0,
-          f"No NaN gradients after checkpointed backward"
+          "No NaN gradients after checkpointed backward"
           + (f" (affected: {nan_grads[:3]})" if nan_grads else ""))
 
     # Restore original forwards
@@ -656,7 +688,6 @@ def test_memory_scaling(dev: torch.device):
     sr  = cfg.sample_rate
     clip_4s = sr * 4
     B4 = 4
-    T4 = stft_frames(clip_4s, cfg.hop_length)
 
     model = PerTrackProcessor(cfg).to(dev).eval()
 
@@ -686,7 +717,7 @@ def test_memory_scaling(dev: torch.device):
 
     except torch.cuda.OutOfMemoryError:
         print(f"    {FAIL} OOM at batch=4 × 4s encoder pass")
-        print(f"    → reduce: --d-model 64 --d-state 8 --batch 2")
+        print("    → reduce: --d-model 64 --d-state 8 --batch 2")
 
 
 # ── section 9: Recipe 1A degradation + f0 gating ───────────────────────────
@@ -752,11 +783,11 @@ def print_summary(results: dict[str, bool]):
     print(f"\n  {passed}/{total} sections passed")
     if passed == total:
         print(f"\n  {PASS} All checks passed — proceed to train.py")
-        print(f"     python train.py --data /path/to/musdb18hq --device cuda")
+        print("     python train.py --data /path/to/musdb18hq --device cuda")
     else:
         failed = [n for n, v in results.items() if not v]
         print(f"\n  {FAIL} Failed sections: {failed}")
-        print(f"  Fix these before running train.py")
+        print("  Fix these before running train.py")
 
 
 # ── main ───────────────────────────────────────────────────────────────────
@@ -775,7 +806,8 @@ def main():
                         help='Section numbers to skip, e.g. --skip 5 7')
     args = parser.parse_args()
 
-    global _CFG
+    global _CFG, _REQUESTED_DEVICE
+    _REQUESTED_DEVICE = args.device
     _CFG = TrackProcessorConfig(
         d_model   = args.d_model,
         d_state   = args.d_state,
@@ -785,7 +817,8 @@ def main():
     )
 
     dev_str = args.device if torch.cuda.is_available() else 'cpu'
-    if dev_str == 'cuda' and not torch.cuda.is_available():
+    # (was `if dev_str == 'cuda' and not available` — unreachable, never warned)
+    if args.device == 'cuda' and not torch.cuda.is_available():
         print(f"{WARN} CUDA/ROCm not available — falling back to CPU")
     dev = torch.device(dev_str)
 
@@ -811,6 +844,8 @@ def main():
     maybe("9", "Recipe 1A degrade + f0 gating", lambda: test_degrade_gating(dev))
 
     print_summary(results)
+    # Non-zero exit so wrappers (run_smoke_test.sh `set -e`, CI) see failures.
+    sys.exit(0 if all(results.values()) else 1)
 
 
 if __name__ == '__main__':
