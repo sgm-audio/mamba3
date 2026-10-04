@@ -41,6 +41,7 @@ except ImportError:
     print("WARNING: auraloss not found. Install: pip install auraloss")
 
 from model import PerTrackProcessor, TrackProcessorConfig
+from degrade import StemDegradation
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +169,10 @@ class TrackProcessorLoss(nn.Module):
             losses['si_sdr']
         )
 
-        self.global_step += 1
+        # NOTE: global_step is set by the train loop at each OPTIMIZER step
+        # (task_loss.global_step = step). It must NOT be incremented per
+        # micro-batch here: with grad_accum > 1 that would fast-forward the
+        # SI-SDR ramp by a factor of grad_accum.
         return losses
 
 
@@ -482,20 +486,27 @@ def train(
     num_workers: int = 4,       # 0 for iGPU shared-RAM; 4+ for cloud GPU
     grad_accum:  int = 1,       # gradient accumulation steps (effective batch = batch_size * grad_accum)
     grad_ckpt:   bool = True,   # gradient checkpointing (saves VRAM, costs ~20% compute)
+    degrade:     bool = True,   # synthetic degradation input → clean target (Recipe 1A)
     early_stop_patience: int = 10,  # val checks with no improvement
 ):
     """
-    Staged training:
-      Phase 1 (0%-20%):   Pretrain semantic encoder (NT-Xent only)
-      Phase 2 (20%-50%):  Single-track processing (no cross-track conditioning)
-      Phase 3 (50%+):     Full cross-track conditioning
+    Staged training (Recipe 1A: self-supervised restoration):
+      Phase 1 (0%-20%):   Pretrain semantic encoder (NT-Xent on two degraded views)
+      Phase 2 (20%-50%):  Single-track restoration (degraded input → clean target)
+      Phase 3 (50%+):     Restoration with cross-track session conditioning
+
+    The model learns to repair realistic capture/edit damage — random EQ
+    resonances/cuts, over-compression, saturation clipping and room reverb
+    (see degrade.StemDegradation) — reconstructing the CLEAN stem.  This is the
+    Option B "adaptive channel strip" objective: the model hears the damaged
+    track (plus the rest of the session in Phase 3) and learns to restore it.
 
     Phase boundaries scale with n_steps. At default n_steps=100k:
       Phase 1 ends at 20k, Phase 2 ends at 50k, Phase 3 runs to 100k.
 
     Memory strategy for shared-RAM iGPU:
       - bf16 AMP (NOT fp16: complex SSM recurrence needs precision)
-      - Gradient checkpointing on Mamba layers
+      - Gradient checkpointing on Mamba layers (honored by model.py)
       - num_workers=0 default (avoids RAM contention with main process)
 
     Resume:
@@ -505,6 +516,8 @@ def train(
     Validation:
       val_split fraction of tracks held out, never seen during training.
       Best checkpoint is selected by val loss, not train loss (much more stable).
+      Validation uses a reseeded deterministic degradation so the val loss is
+      comparable across checks (stable early stopping).
     """
     if cfg is None:
         cfg = TrackProcessorConfig()
@@ -529,8 +542,17 @@ def train(
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
 
-    for layer in model.mamba_layers:
+    # Honored by Mamba3MIMOLayer.forward → torch.utils.checkpoint when True.
+    # Covers BOTH stacks: the 6 processing layers and the 2 semantic-encoder
+    # layers (previously the attribute was set but never read — a no-op).
+    for layer in list(model.mamba_layers) + list(model.semantic_enc.mamba_layers):
         layer.gradient_checkpointing = grad_ckpt
+
+    # ────────────────────────────────────────────────────────────────
+    # Synthetic degradation (Recipe 1A): degraded input → clean target
+    # ────────────────────────────────────────────────────────────────
+    degradation     = StemDegradation(sample_rate=cfg.sample_rate) if degrade else None
+    val_degradation = StemDegradation(sample_rate=cfg.sample_rate, seed=1234) if degrade else None
 
     # ────────────────────────────────────────────────────────────────
     # Losses
@@ -681,35 +703,47 @@ def train(
         model.eval()
         total_loss = 0.0
         n_batches = 0
+        if val_degradation is not None:
+            # Deterministic degradation for stable early stopping
+            val_degradation.reseed(1234)
         for v_batch in val_loader:
             if v_batch is None:
                 continue
             v_target = v_batch['target'].to(dev)
             v_crepe  = v_batch['target_crepe'].to(dev)
+            v_pitched = v_batch['target_pitched'].to(dev)
+            v_other_pitched = v_batch['other_pitched'].to(dev)
+            # Recipe 1A: the model input is the DEGRADED stem; the clean stem
+            # is the target. Validation measures restoration quality.
+            v_degraded = val_degradation(v_target) if val_degradation is not None else v_target
             if current_phase == 1:
-                # Phase 1 validates with contrastive loss on target
-                z1 = _encode_for_contrastive(model, v_target, cfg, dev)
+                # Phase 1 validates with contrastive loss on degraded views
+                z1 = _encode_for_contrastive(model, v_degraded, cfg, dev)
                 # use a slightly augmented copy for the second view
-                z2 = _encode_for_contrastive(model, _augment_for_contrastive(v_target), cfg, dev)
+                z2 = _encode_for_contrastive(model, _augment_for_contrastive(v_degraded), cfg, dev)
                 with torch.autocast(device_type=device, dtype=autocast_dtype, enabled=amp):
                     vl = contrastive(z1, z2)
             else:
-                # Phase 2/3 validates with reconstruction
+                # Phase 2/3 validates restoration (degraded → clean)
                 with torch.autocast(device_type=device, dtype=autocast_dtype, enabled=amp):
                     if current_phase == 3:
-                        # Build other_embs from val stems
+                        # Build other_embs from val stems (session context stays
+                        # clean — the plugin hears the other tracks as they are).
                         v_other = v_batch['other_stems'].to(dev)
                         K = v_other.shape[1]
                         embs = []
                         T_frames = 1 + v_target.shape[-1] // cfg.hop_length
                         for k in range(K):
                             v_crepe_k = v_batch['other_crepe'][:, k, :, :].to(dev)
-                            out_k = model(v_other[:, k, :], v_crepe_k, other_embs=None)
+                            out_k = model(v_other[:, k, :], v_crepe_k, other_embs=None,
+                                          target_pitched=v_other_pitched[:, k])
                             embs.append(out_k['track_emb'])
                         other_embs = torch.stack(embs, dim=1)
-                        out = model(v_target, v_crepe, other_embs=other_embs)
+                        out = model(v_degraded, v_crepe, other_embs=other_embs,
+                                    target_pitched=v_pitched)
                     else:
-                        out = model(v_target, v_crepe, other_embs=None)
+                        out = model(v_degraded, v_crepe, other_embs=None,
+                                    target_pitched=v_pitched)
                     vl_dict = task_loss(out['output_stft'], v_target, model)
                     vl = vl_dict['total']
             if not (torch.isnan(vl) or torch.isinf(vl)):
@@ -733,8 +767,12 @@ def train(
     if not grad_ckpt:
         print(f"Gradient checkpointing: OFF (max VRAM, fastest compute)")
     print(f"Phase 1 (contrastive):  step 0       → {PHASE_1_END}")
-    print(f"Phase 2 (single-track): step {PHASE_1_END} → {PHASE_2_END}")
-    print(f"Phase 3 (cross-track):  step {PHASE_2_END} → {n_steps}")
+    print(f"Phase 2 (single-track restoration): step {PHASE_1_END} → {PHASE_2_END}")
+    print(f"Phase 3 (cross-track restoration):  step {PHASE_2_END} → {n_steps}")
+    if degradation is not None:
+        print(f"Recipe 1A: ON — degraded input (EQ/comp/sat/reverb) → clean target")
+    else:
+        print(f"Recipe 1A: OFF (--no-degrade) — training on clean input → clean target")
     if start_step > 0:
         print(f"Resuming at step {start_step}")
     print()
@@ -750,6 +788,8 @@ def train(
             other_stems  = batch['other_stems'].to(dev)
             target_crepe = batch['target_crepe'].to(dev)
             other_crepe  = batch['other_crepe'].to(dev)
+            target_pitched = batch['target_pitched'].to(dev)      # (B,)
+            other_pitched  = batch['other_pitched'].to(dev)       # (B, K)
             B = target.shape[0]
             # FIX: use 1 + L/hop to match torch.stft(center=True), NOT (L-n_fft)//hop+1
             T_frames = 1 + target.shape[-1] // cfg.hop_length
@@ -771,27 +811,39 @@ def train(
             with torch.autocast(device_type=device, dtype=autocast_dtype, enabled=amp):
 
                 if current_phase == 1:
+                    # Two degraded views of the same stem = positive pair.
                     aug1 = _augment_for_contrastive(target)
                     aug2 = _augment_for_contrastive(target)
+                    if degradation is not None:
+                        aug1 = degradation(aug1)
+                        aug2 = degradation(aug2)
                     z1 = _encode_for_contrastive(model, aug1, cfg, dev)
                     z2 = _encode_for_contrastive(model, aug2, cfg, dev)
                     loss = contrastive(z1, z2)
                     loss_dict = {'total': loss, 'contrastive': loss}
 
                 elif current_phase == 2:
-                    out = model(target, target_crepe, other_embs=None)
+                    # Recipe 1A: degraded input → clean target (restoration).
+                    model_in = degradation(target) if degradation is not None else target
+                    out = model(model_in, target_crepe, other_embs=None,
+                                target_pitched=target_pitched)
                     loss_dict = task_loss(out['output_stft'], target, model)
 
                 else:  # Phase 3
+                    # Recipe 1A with session context: restore MY damaged track
+                    # while hearing the clean other tracks of the session.
                     K = other_stems.shape[1]
                     other_embs_list = []
                     for k in range(K):
                         stem_k  = other_stems[:, k, :]
                         crepe_k = other_crepe[:, k, :, :]
-                        out_k = model(stem_k, crepe_k, other_embs=None)
+                        out_k = model(stem_k, crepe_k, other_embs=None,
+                                      target_pitched=other_pitched[:, k])
                         other_embs_list.append(out_k['track_emb'])
                     other_embs = torch.stack(other_embs_list, dim=1)
-                    out = model(target, target_crepe, other_embs=other_embs)
+                    model_in = degradation(target) if degradation is not None else target
+                    out = model(model_in, target_crepe, other_embs=other_embs,
+                                target_pitched=target_pitched)
                     loss_dict = task_loss(out['output_stft'], target, model)
 
             loss = loss_dict['total']
@@ -804,7 +856,14 @@ def train(
             (loss * loss_scale).backward()
             accum_step += 1
 
-            # Step optimizer every grad_accum steps (or at end of accumulation)
+            # ────────────────────────────────────────────────────────
+            # Optimizer step every grad_accum micro-batches.
+            # Everything below (step counter, LR schedule, SI-SDR ramp
+            # bookkeeping, logging, validation, checkpointing) advances on
+            # OPTIMIZER steps only — with grad_accum > 1 a micro-batch must
+            # not increment `step`, or schedules and cadences desynchronize
+            # by a factor of grad_accum.
+            # ────────────────────────────────────────────────────────
             if accum_step >= grad_accum:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
@@ -812,60 +871,63 @@ def train(
                 optimizer.zero_grad(set_to_none=True)
                 accum_step = 0
 
-            # ── Logging ──
-            if step % log_every == 0:
-                lr_now = optimizer.param_groups[0]['lr']
-                now = time.time()
-                steps_per_sec = (step - last_log_step) / max(1e-6, now - last_log_time)
-                last_log_time = now
-                last_log_step = step
+                step += 1
+                _state['step'] = step
+                # Keep the SI-SDR ramp locked to the true optimizer step.
+                task_loss.global_step = step
 
-                log_str = (
-                    f"[step {step:6d}] phase={current_phase} "
-                    f"loss={loss.item():.4f} lr={lr_now:.2e} "
-                    f"{steps_per_sec:.2f} step/s"
-                )
-                if 'mr_stft' in loss_dict:
-                    log_str += f" mr_stft={loss_dict['mr_stft'].item():.4f}"
-                if 'si_sdr' in loss_dict and loss_dict['si_sdr'].item() != 0:
-                    log_str += f" si_sdr={loss_dict['si_sdr'].item():.4f}"
-                print(log_str)
+                # ── Logging ──
+                if step % log_every == 0:
+                    lr_now = optimizer.param_groups[0]['lr']
+                    now = time.time()
+                    steps_per_sec = (step - last_log_step) / max(1e-6, now - last_log_time)
+                    last_log_time = now
+                    last_log_step = step
 
-            # ── Validation + best checkpoint ──
-            if step > 0 and step % val_every == 0:
-                print(f"  Running validation at step {step}...")
-                val_loss = validate(current_phase)
-                print(f"  val_loss = {val_loss:.4f}  (best={best_val_loss:.4f})")
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    save_checkpoint(step, loss.item(), is_best=True)
-                    print(f"  ✓ new best val loss — saved best.pt")
-                    plateau_count = 0
-                else:
-                    plateau_count += 1
-                    if plateau_count >= early_stop_patience:
-                        print(f"  ! Validation plateaued for {early_stop_patience} checks — early stopping")
-                        save_checkpoint(step, loss.item(), name="final_earlystop.pt")
-                        return model
+                    log_str = (
+                        f"[step {step:6d}] phase={current_phase} "
+                        f"loss={loss.item():.4f} lr={lr_now:.2e} "
+                        f"{steps_per_sec:.2f} step/s"
+                    )
+                    if 'mr_stft' in loss_dict:
+                        log_str += f" mr_stft={loss_dict['mr_stft'].item():.4f}"
+                    if 'si_sdr' in loss_dict and loss_dict['si_sdr'].item() != 0:
+                        log_str += f" si_sdr={loss_dict['si_sdr'].item():.4f}"
+                    print(log_str)
 
-            # ── Regular checkpoint ──
-            if step > 0 and step % ckpt_every == 0:
-                save_checkpoint(step, loss.item())
-                # Compact: print only every 5 ckpts to avoid spam
-                if step % (ckpt_every * 5) == 0:
-                    print(f"  ✓ checkpoint at step {step}")
+                # ── Validation + best checkpoint ──
+                if step > 0 and step % val_every == 0:
+                    print(f"  Running validation at step {step}...")
+                    val_loss = validate(current_phase)
+                    print(f"  val_loss = {val_loss:.4f}  (best={best_val_loss:.4f})")
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        save_checkpoint(step, loss.item(), is_best=True)
+                        print(f"  ✓ new best val loss — saved best.pt")
+                        plateau_count = 0
+                    else:
+                        plateau_count += 1
+                        if plateau_count >= early_stop_patience:
+                            print(f"  ! Validation plateaued for {early_stop_patience} checks — early stopping")
+                            save_checkpoint(step, loss.item(), name="final_earlystop.pt")
+                            return model
 
-            # ── Signal-triggered exit ──
+                # ── Regular checkpoint ──
+                if step > 0 and step % ckpt_every == 0:
+                    save_checkpoint(step, loss.item())
+                    # Compact: print only every 5 ckpts to avoid spam
+                    if step % (ckpt_every * 5) == 0:
+                        print(f"  ✓ checkpoint at step {step}")
+
+                if step >= n_steps:
+                    break
+
+            # ── Signal-triggered exit (checked every micro-batch) ──
             if _state['interrupted']:
                 print(f"\n! Saving interrupt checkpoint at step {step}...")
                 save_checkpoint(step, loss.item(), name=f"interrupt_{step:06d}.pt")
                 print(f"  ✓ saved. Resume with: --resume {save_path}/interrupt_{step:06d}.pt")
                 return model
-
-            step += 1
-            _state['step'] = step
-            if step >= n_steps:
-                break
 
     print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
     save_checkpoint(step, loss.item(), name="final.pt")
@@ -943,6 +1005,9 @@ if __name__ == '__main__':
                         help='Gradient accumulation steps (effective batch = batch × grad-accum)')
     parser.add_argument('--no-grad-ckpt', action='store_true',
                         help='Disable gradient checkpointing (uses more VRAM, ~20%% faster)')
+    parser.add_argument('--no-degrade', action='store_true',
+                        help='Disable synthetic degradation (Recipe 1A). '
+                             'Default: degraded input → clean target restoration.')
 
     # Validation + checkpointing cadence
     parser.add_argument('--val-split',   type=float, default=0.1,
@@ -990,5 +1055,6 @@ if __name__ == '__main__':
         num_workers         = args.num_workers,
         grad_accum          = args.grad_accum,
         grad_ckpt           = not args.no_grad_ckpt,
+        degrade             = not args.no_degrade,
         early_stop_patience = args.early_stop_patience,
     )

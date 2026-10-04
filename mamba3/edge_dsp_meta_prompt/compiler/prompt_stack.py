@@ -1,5 +1,10 @@
 import numpy as np
 
+# 6C: Fixed 8-D customer/tone profile embedding, carried in session_state[8:16].
+# Learned per customer via prompt-tuning (fit_profile.py) with ALL model weights
+# frozen — see REFERENCE_THIS_SHIT.md § "Customer Profile Prompt-Tuning (6C)".
+PROFILE_DIM = 8
+
 class PromptStack:
     """
     Programmatic representation of the 5-layer Meta-Prompt Architecture Stack.
@@ -45,25 +50,42 @@ class PromptStack:
             "Melodic": [0.0, 0.0, 0.0, 1.0],
         }
 
-    def compile_session_state(self, track_type: str, bpm: float, timeline_pos_samples: int, sample_rate: float) -> np.ndarray:
+    def compile_session_state(self, track_type: str, bpm: float, timeline_pos_samples: int,
+                              sample_rate: float, profile: np.ndarray = None) -> np.ndarray:
         """
         Compiles Layer 1 (Session State Context) into a static embedding vector.
-        Features included: track type one-hot encoding, timeline offset, tempo, grid alignment.
+        Features included: track type one-hot encoding, timeline offset, tempo,
+        grid alignment, and (6C) an 8-D customer/tone profile embedding.
+
+        profile: optional (8,) float32 in [-1, 1] — the per-customer prompt-tuned
+        embedding (fit_profile.py). Zeros = neutral/no profile. The controller
+        (Mamba3Controller) consumes the full 16-D vector, so the profile steers
+        DSP parameter taste without touching any model weight.
         """
         track_emb = self.track_types.get(track_type, [0.0, 0.0, 0.0, 0.0])
-        
+
+        if profile is None:
+            profile_vec = np.zeros(PROFILE_DIM, dtype=np.float32)
+        else:
+            profile_vec = np.asarray(profile, dtype=np.float32).reshape(-1)
+            if profile_vec.shape[0] != PROFILE_DIM:
+                raise ValueError(f"profile must have {PROFILE_DIM} dims, got {profile_vec.shape[0]}")
+            profile_vec = np.clip(profile_vec, -1.0, 1.0)
+
         # Calculate grid position (sub-beat offset)
         samples_per_beat = (60.0 / bpm) * sample_rate
         beat_offset = (timeline_pos_samples % int(samples_per_beat)) / samples_per_beat
 
-        session_vector = np.array([
-            track_emb[0], track_emb[1], track_emb[2], track_emb[3], # 0-3: Track type one-hot
-            bpm / 200.0,                                            # 4: Normalized tempo
-            beat_offset,                                            # 5: Beat alignment [0.0, 1.0]
-            sample_rate / 96000.0,                                  # 6: Normalized sample rate
-            (timeline_pos_samples / sample_rate) / 300.0,           # 7: Timeline position (normalized to 5 mins)
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0                  # 8-15: Padding for 16-D boundary alignment
-        ], dtype=np.float32)
+        session_vector = np.concatenate([
+            np.array([
+                track_emb[0], track_emb[1], track_emb[2], track_emb[3], # 0-3: Track type one-hot
+                bpm / 200.0,                                            # 4: Normalized tempo
+                beat_offset,                                            # 5: Beat alignment [0.0, 1.0]
+                sample_rate / 96000.0,                                  # 6: Normalized sample rate
+                (timeline_pos_samples / sample_rate) / 300.0,           # 7: Timeline position (normalized to 5 mins)
+            ], dtype=np.float32),
+            profile_vec,                                                # 8-15: Customer/tone profile (6C)
+        ]).astype(np.float32)
 
         return session_vector
 

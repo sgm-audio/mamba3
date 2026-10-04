@@ -101,3 +101,38 @@ ls -la checkpoints/
 - `--resume` restores model, optimizer, scheduler, and step counter
 - Dataset expected at `/workspace/datasets/musdb18hq/train/`
 - Checkpoints save to `./checkpoints/` in the working directory
+
+---
+
+## Recipe 1A note (training objective)
+
+`train.py` now trains a **restorer**: each batch feeds a synthetically degraded
+stem (random EQ resonances/cuts, over-compression, saturation, room reverb —
+see `mamba3/degrade.py`) into the model and scores it against the CLEAN stem.
+Validation uses a seeded deterministic degradation for stable early stopping.
+To ablate the old behavior pass `--no-degrade`.
+
+## Edge controller: distill → quantize → embed (Way 5A)
+
+After (or alongside) PerTrackProcessor training, the real-time plugin's
+controller can be produced entirely on the pod (CPU is enough — the controller
+is tiny):
+
+```bash
+# 1. Distill the GoldenPolicy teacher into the Mamba-3 controller and export
+#    the clean single-step ONNX (3 inputs / 2 outputs — no unrolled window):
+python mamba3/edge_dsp_meta_prompt/compiler/train_controller.py \
+    --steps 2000 --device cuda \
+    --export controller.onnx --quantized mamba3_controller_quant.onnx
+
+# 2. (Per customer) fit the 8-D tone profile — Way 6C, weights frozen:
+python mamba3/edge_dsp_meta_prompt/compiler/fit_profile.py \
+    --data client_features/ --profile-out profile.npy
+
+# 3. Copy the quantized model back into the plugin and rebuild:
+cp mamba3_controller_quant.onnx mamba3/edge_dsp_meta_prompt/mamba3_controller_quant.onnx
+cargo xtask bundle cynical-engineer --release   # on a machine with Rust
+```
+
+`compiler/quantize.py` enforces the 3-input/2-output signature gate and an
+fp32↔int8 parity check, so a bad export can never reach the plugin worker.
