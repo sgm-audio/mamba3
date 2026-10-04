@@ -1,18 +1,9 @@
 # Mamba-3 Native Ubuntu Training Guide
 
-<!-- STATUS: in progress -->
-> **Status (review 2026-10-04): in progress.** This guide references `setup_env.sh` and
-> `extract_f0.sh`, which are **not in the repository** (only `run_smoke_test.sh` and
-> `run_train.sh` exist, and both expect a venv at `mamba3/.venv`). Until those scripts
-> are added, create the venv manually (`python3 -m venv .venv && . .venv/bin/activate`,
-> install the ROCm PyTorch wheel for your GPU, then `pip install -r requirements.txt`)
-> and run `python extract_crepe.py --data <musdb18hq>/train --device cuda --model full`
-> directly. The two launcher scripts also hard-code a personal dataset path
-> (`/media/sgm/bazzite/...`) — pass `--data <path>` to override.
-
-> **A simplified, high-performance training guide designed for native Ubuntu hosts running AMD GPUs (RDNA3/RDNA3.5, Radeon 860M) with optimized UMA buffer parameters.**
-
-This guide transitions the entire **Mamba-3 MIMO Audio Separator** training pipeline from complex containerized setups to simple native shell scripts. It references your native mounts and enforces a optimized **16 GB UMA buffer budget** to ensure thermal safety and prevent out-of-memory (OOM) crashes.
+> **Scripts:** `setup_env.sh` (venv + PyTorch; `TORCH_INDEX=` selects ROCm/CUDA/CPU wheels),
+> `run_smoke_test.sh`, `extract_f0.sh` (`DATASET_ROOT=` override) and `run_train.sh`
+> (`DATASET_DIR=` override, or pass `--data`). The defaults below point at one specific machine's
+> mounts — set the env vars for yours.
 
 ---
 
@@ -37,7 +28,7 @@ chmod +x setup_env.sh run_smoke_test.sh extract_f0.sh run_train.sh
 ```
 
 ### Step 2.2: Pre-extract CREPE Pitch Tracks (CRITICAL)
-Phases 2 and 3 of the Mamba-3 separator depend on pre-extracted frame-level F0 frequency projections. Run this step to process all 100 tracks in your mounted dataset natively on your GPU:
+Phases 2 and 3 of the Mamba-3 separator depend on pre-extracted frame-level F0 frequency projections. Run this step to process the `train/` and `test/` splits under `$DATASET_ROOT` natively on your GPU (`--model full`; pass `--model tiny` for a faster, less accurate pass):
 ```bash
 ./extract_f0.sh
 ```

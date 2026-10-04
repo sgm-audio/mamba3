@@ -133,9 +133,8 @@ python mamba3/edge_dsp_meta_prompt/compiler/fit_profile.py \
 
 # 3. Copy the quantized model back into the plugin and rebuild:
 cp mamba3_controller_quant.onnx mamba3/edge_dsp_meta_prompt/mamba3_controller_quant.onnx
-# on a machine with Rust — NOTE: the workspace has no `xtask` crate yet, so
-# `cargo xtask bundle` is not available; `cargo build --release -p edge_dsp_plugin`
-# builds the cdylib. <!-- STATUS: research --> (CLAP bundling step still to be set up)
+cd mamba3/edge_dsp_meta_prompt && cargo xtask bundle edge_dsp_plugin --release   # on a machine with Rust → target/bundled/Cynical Engineer.clap
+# <!-- STATUS: research --> the Rust workspace has not yet been built in CI; first build still to be recorded
 ```
 
 `compiler/quantize.py` enforces the 3-input/2-output signature gate and an

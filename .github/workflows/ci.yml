@@ -55,3 +55,31 @@ jobs:
           python train.py --data /tmp/ds/train --save /tmp/ck --device cpu --batch 2 --steps 4 \
             --val-every 2 --ckpt-every 2 --log-every 1 --num-workers 0 --d-model 64 --n-layers 1 --val-split 0.25
           test -f /tmp/ck/final.pt && test -f /tmp/ck/best.pt
+
+  rust-check:
+    name: Rust workspace (cargo check) — advisory
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The review that added this job had no Rust toolchain available, so the
+    # workspace has never been compiled in CI. Advisory until the first green
+    # run; then drop `continue-on-error` and add `cargo test -p edge_dsp_core`.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System deps for nih-plug
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgl-dev libjack-jackd2-dev libx11-xcb-dev libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mamba3/edge_dsp_meta_prompt
+      - name: cargo check (all workspace members)
+        working-directory: mamba3/edge_dsp_meta_prompt
+        run: cargo check --workspace --all-targets
+      - name: cargo test (RT core crate)
+        working-directory: mamba3/edge_dsp_meta_prompt
+        run: cargo test -p edge_dsp_core
+      - name: Upload Cargo.lock (commit it once this job is green)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cargo.lock
+          path: mamba3/edge_dsp_meta_prompt/Cargo.lock

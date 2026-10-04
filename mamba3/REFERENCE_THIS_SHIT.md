@@ -3,7 +3,7 @@
 This document serves as the quick-reference for the **Edge-Inference DSP Meta-Prompt Stack** and **CLAP Plugin Framework** codebase under `mamba3/edge_dsp_meta_prompt/` (paths below are relative to that directory).
 
 <!-- STATUS: in progress -->
-> **Status (review 2026-10-04):** the Python toolchain (`compiler/`) is runnable and tested; the Rust crates have **not been built in CI** (no `Cargo.lock`, `nih_plug` is a git dependency, `ort` is pinned to a 2.0 release candidate) and the committed ONNX artifact is the legacy one (see §2). Treat the Rust side as unverified until a `cargo build` is on record.
+> **Status (review 2026-10-04):** the Python toolchain (`compiler/`) is runnable and tested; the Rust crates have **not yet been compiled anywhere on record** (the review sandbox had no Rust toolchain). `nih_plug` is now pinned to a commit, an `xtask` bundler crate was added, and CI runs an advisory `cargo check` — commit the `Cargo.lock` it produces once green. `ort` is still a 2.0 release candidate. Treat the Rust side as unverified until that job passes.
 
 ---
 
@@ -62,7 +62,7 @@ The quantized Mamba3 Controller ONNX model (`mamba3_controller_quant.onnx`) expe
 | **`dsp_parameters`** (Output) | `[1, 32]` | `f32` | 32 tanh-bounded control coefficients mapped to classical DSP (`train_controller.py::PARAM_LAYOUT`). |
 | **`hidden_state_out`** (Output) | `[1, 3, 64]` | `f32` | Next packed recurrent state, fed into the next inference cycle. |
 
-> ⚠️ **Legacy artifact warning — the checked-in `mamba3_controller_quant.onnx` does NOT match this contract.** Inspected with onnxruntime (review 2026-10-04) it declares `observer_features [1, 100, 12]` (the old 100-frame window), `hidden_state_in [1, 64]` (one layer, not `[1, 3, 64]`), plus the leaked `onnx::Mul_3` / `onnx::Mul_4` inputs and `onnx::Mul_3168` / `onnx::Mul_4689` outputs from the tuple-unpacking export bug. `plugin/src/worker.rs` zero-fills unknown inputs and reads outputs by name, **but it fills `observer_features` with 12 floats and `hidden_state_in` with 192 floats regardless of the declared shape**, so `Tensor::from_array` fails on every tick against the legacy artifact and the plugin silently stays on neutral DSP parameters. The artifact must be regenerated before the plugin is useful: `python compiler/train_controller.py --steps 2000 --export controller.onnx --quantized mamba3_controller_quant.onnx` (the export path itself was broken until this review — see `compiler/test_controller.py`). <!-- STATUS: in progress -->
+> ✅ **Artifact status (2026-10-04):** the committed `mamba3_controller_quant.onnx` was regenerated with the fixed Way 5A exporter (`compiler/train_controller.py --steps 2000 --export … --quantized …`, GoldenPolicy distillation loss 0.499 → 0.017, INT8 parity 0.0084, 200-step rollout MAE vs. teacher 0.043 in tanh space). It exposes exactly the 3-input / 2-output contract above. The previous (legacy) artifact declared `observer_features [1, 100, 12]` and `hidden_state_in [1, 64]` plus leaked `onnx::Mul_*` tensors and could **not** be consumed by `plugin/src/worker.rs`; the worker now validates declared element counts at startup and refuses such graphs with an explicit message instead of failing silently every tick.
 
 ---
 

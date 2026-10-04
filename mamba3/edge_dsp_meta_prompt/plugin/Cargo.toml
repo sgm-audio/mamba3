@@ -8,7 +8,8 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 edge_dsp_core = { path = "../core" }
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_no_alloc"] }
+# Pinned to a specific upstream commit (nih-plug has no crates.io release); bump deliberately.
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683", features = ["assert_no_alloc"] }
 # NOTE: the previously pinned ort 1.16.3 is YANKED on crates.io (unbuildable).
 # Updated to the current maintained line (ONNX Runtime 1.28 wrapper); the
 # worker targets the 2.0-rc session/value API. `load-dynamic` dlopens the ORT

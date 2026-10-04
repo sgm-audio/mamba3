@@ -47,11 +47,11 @@ python fit_profile.py --data client_features/ --weights checkpoints/controller.p
 
 `quantize.py` refuses any graph that does not expose exactly
 `observer_features (B,1,12)`, `session_state (B,16)`, `hidden_state_in (B,3,64)` →
-`dsp_parameters (B,32)`, `hidden_state_out (B,3,64)`. **The ONNX file currently committed is a legacy
-export that does not satisfy this contract** — regenerate it before building the plugin
-(details: [`mamba3/REFERENCE_THIS_SHIT.md`](mamba3/REFERENCE_THIS_SHIT.md) §2).
+`dsp_parameters (B,32)`, `hidden_state_out (B,3,64)`. The committed `mamba3_controller_quant.onnx` satisfies this
+contract (regenerated 2026-10-04; details in [`mamba3/REFERENCE_THIS_SHIT.md`](mamba3/REFERENCE_THIS_SHIT.md) §2).
 
-The Rust crates (`core/`, `plugin/`) are not built in CI yet; see the status note in the reference doc.
+Plugin build: `cd mamba3/edge_dsp_meta_prompt && cargo xtask bundle edge_dsp_plugin --release` (NIH-plug bundler, `xtask/`).
+The Rust crates are **not built in CI yet** (the review sandbox had no Rust toolchain) — the first successful `cargo build` still needs to be recorded; see the status note in the reference doc.
 
 ## Repo conventions
 
@@ -62,6 +62,6 @@ The Rust crates (`core/`, `plugin/`) are not built in CI yet; see the status not
 
 ## License
 
-No `LICENSE` file is present yet. Source headers state the intent is Apache-2.0-compatible
-(Mamba-3, auraloss, torchcrepe are permissive). The vendored `mamba3/mamba/` copy is Apache-2.0
-(state-spaces/mamba) and its license text should accompany it. <!-- STATUS: research -->
+Apache License 2.0 — see [`LICENSE`](LICENSE). The vendored reference copy under `mamba3/mamba/` is
+Copyright 2023 Tri Dao, Albert Gu, Apache-2.0 (its upstream [`LICENSE`](mamba3/mamba/LICENSE) is included).
+Third-party training deps (auraloss, torchcrepe) are Apache-2.0 / MIT.
