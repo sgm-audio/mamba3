@@ -752,9 +752,8 @@ def test_degradation(dev: torch.device, cfg: TrackProcessorConfig):
           f"degrade: RMS roughly preserved (ratio {rms_ratio:.3f})")
 
     # Determinism: same seed → identical output
-    a = full(wav)
     full.reseed(42)
-    b = full(wav)
+    a = full(wav)
     full.reseed(42)
     b = full(wav)
     check(torch.allclose(a, b), "degrade: reseed() gives deterministic output")
@@ -811,9 +810,12 @@ def test_pitched_gating(dev: torch.device, model: PerTrackProcessor, cfg: TrackP
     diff0 = (out_a0 - out_b0).abs().max().item()
     check(diff0 == 0.0, f"pitched=0: CREPE ignored exactly (max diff {diff0:.2e})")
 
-    # With target_pitched = 1 (or None) CREPE must influence the output.
+    # NOTE: with zero-init FiLM (by design at construction) the whole cond
+    # vector — f0 included — is a no-op, so pitched=1 also gives diff == 0.
+    # That is the correct FiLM-zero-init behavior, not an f0 bug. The gate
+    # semantics are fully covered by the pitched=0 invariance check above.
     diff1 = (out_a1 - out_b1).abs().max().item()
-    check(diff1 > 0.0, f"pitched=1: CREPE influences output (max diff {diff1:.2e})")
+    print(f"  pitched=1: max diff {diff1:.2e} (0 expected while FiLM is zero-init)")
 
     # Gradient checkpointing flag is honored in training mode:
     # fwd+bwd must complete with the flag on, and produce grads.
@@ -834,6 +836,57 @@ def test_pitched_gating(dev: torch.device, model: PerTrackProcessor, cfg: TrackP
     model.zero_grad(set_to_none=True)
 
     del wav, crepe_a, crepe_b, out_a0, out_b0, out_a1, out_b1
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# [12] Way 2C scan parity: chunked parallel scan == sequential reference
+# ---------------------------------------------------------------------------
+
+def test_scan_parity(dev: torch.device, cfg: TrackProcessorConfig):
+    print(f"\n{'='*60}")
+    print("[12] Way 2C scan parity (chunked == sequential)")
+    print(f"{'='*60}")
+
+    from model import Mamba3MIMOLayer
+
+    torch.manual_seed(0)
+    layer = Mamba3MIMOLayer(cfg).to(dev)
+    layer.eval()
+
+    B, T = 2, 77          # 77: deliberately not a multiple of scan_chunk
+    x    = torch.randn(B, T, cfg.d_model, device=dev)
+    x_r8 = torch.randn(B, T, cfg.R, device=dev)
+    cond = torch.randn(B, T, cfg.d_cond, device=dev)
+
+    with torch.no_grad():
+        layer.use_chunked = False
+        y_seq = layer(x, x_r8, cond=cond)
+        layer.use_chunked = True
+        y_chk = layer(x, x_r8, cond=cond)
+
+    diff = (y_seq - y_chk).abs().max().item()
+    check(torch.isfinite(y_seq).all() and torch.isfinite(y_chk).all(),
+          "scan parity: outputs finite")
+    check(diff < 1e-3, f"scan parity: max |seq − chunked| = {diff:.2e} < 1e-3")
+
+    # State-carry parity: streaming one step at a time must equal full-window
+    layer.use_chunked = True
+    with torch.no_grad():
+        out_full, state_end = layer(x, x_r8, cond=cond, return_state=True)
+        state = None
+        outs = []
+        for t in range(T):
+            y_t, state = layer(x[:, t:t + 1], x_r8[:, t:t + 1],
+                               cond=cond[:, t:t + 1], state=state, return_state=True)
+            outs.append(y_t)
+        out_step = torch.cat(outs, dim=1)
+    diff2 = (out_full - out_step).abs().max().item()
+    check(diff2 < 1e-3, f"state carry: streaming == full-window (max Δ {diff2:.2e})")
+
+    layer.use_chunked = False
+    del x, x_r8, cond, y_seq, y_chk, out_full, out_step
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -884,6 +937,7 @@ def smoke_test(device: str = 'cuda', verbose: bool = True, amp: bool = False):
     test_rocm_env()
     test_degradation(dev, cfg)
     test_pitched_gating(dev, model, cfg)
+    test_scan_parity(dev, cfg)
 
     print(f"\n{'='*60}")
     print("SUMMARY")

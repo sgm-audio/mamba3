@@ -253,15 +253,15 @@ def test_submodules(dev: torch.device):
         diff = (y_cond - y_no_cond).abs().mean().item()
         check(diff > 1e-6, f"MIMO cond changes output (mean Δ={diff:.4e})")
 
-    # Verify A_d magnitude ≤ 1 (stability: poles inside unit disk)
-    A_d, _ = layer._discretize_trapezoidal(
-        layer.log_a_real,
-        layer.a_imag,
-        torch.full((B, T, cfg.n_heads), 0.01, device=dev)
-    )
-    pole_mag = A_d.abs().max().item()
-    check(pole_mag <= 1.0 + 1e-5,
-          f"Trapezoidal discretization: max pole magnitude {pole_mag:.6f} ≤ 1")
+    # Verify decay stability (Way 2B exponential-trapezoidal poles):
+    # α = exp(Δ·A_h) with A_h = -exp(log_a_real) < 0 ⇒ |α| ≤ 1 by construction.
+    A_decay = -torch.exp(layer.log_a_real)
+    dt_test = torch.full((B, T, cfg.n_heads), 0.01, device=dev)
+    alpha = torch.exp(dt_test * A_decay)
+    pole_mag = alpha.abs().max().item()
+    check(bool((A_decay < 0).all()), "Decay poles A_h = -exp(log_a_real) strictly negative")
+    check(pole_mag <= 1.0 + 1e-6,
+          f"Exp-trapezoidal decay: max |α| {pole_mag:.6f} ≤ 1")
 
     # ── CrossTrackAggregator ──
     print("  CrossTrackAggregator:")
@@ -484,10 +484,10 @@ def test_forward_backward(dev: torch.device):
         flag = WARN if v > 100 else PASS
         print(f"      {flag} {v:8.4f}  {n}")
 
-    # SSM-specific: check log_a_real and a_imag got gradients
-    # (these are the pole parameters — must be trained)
+    # SSM-specific: check decay + MIMO gain parameters got gradients
+    # (these are the pole / rank-mixture parameters — must be trained)
     for i, layer in enumerate(model.mamba_layers):
-        for pname in ['log_a_real', 'a_imag']:
+        for pname in ['log_a_real', 'MIMO_V', 'MIMO_O']:
             p = getattr(layer, pname, None)
             if p is not None and p.grad is not None:
                 check(not torch.isnan(p.grad).any(),
@@ -716,6 +716,12 @@ def test_degrade_gating(dev: torch.device):
     # f0 gating: target_pitched=0 must make CREPE irrelevant
     cfg = _CFG
     model = PerTrackProcessor(cfg).to(dev).eval()
+    # Zero-init FiLM makes ALL of cond (f0 included) a no-op at construction —
+    # correct by design. Randomize FiLM so the f0 pathway can show influence.
+    with torch.no_grad():
+        for lyr in model.mamba_layers:
+            lyr.film_proj.weight.normal_(0.0, 0.1)
+            lyr.film_proj.bias.normal_(0.0, 0.1)
     T = stft_frames(L, cfg.hop_length)
     c1 = torch.softmax(torch.randn(1, T, 360, device=dev), dim=-1)
     c2 = torch.softmax(torch.randn(1, T, 360, device=dev), dim=-1)

@@ -6,7 +6,8 @@ Option B: Context-aware per-track transform.
 
 Architecture:
   - R=8 structured spectral feature extractor (learnable band boundaries)
-  - Mamba-3 MIMO recurrence (complex poles, trapezoidal discretization)
+  - Mamba-3 MIMO recurrence (Way 2B: data-dependent rotary angle state +
+    exponential-trapezoidal K/V outer-product update; Way 2C chunked scan)
   - FiLM conditioning from cross-track aggregator (CREPE f0 + semantic)
   - Waveform decoder (overlap-add synthesis)
 
@@ -54,14 +55,18 @@ class TrackProcessorConfig:
     # slots 7,8 = transient (computed) + centroid (computed)
     R: int = 8
 
-    # Mamba-3 MIMO core
+    # Mamba-3 MIMO core (Way 2B: official arXiv:2603.15569 MIMO formulation —
+    # rotary angle state + exponential-trapezoidal K/V outer-product update;
+    # Way 2C: chunked parallel scan). State per head is a (P×D) matrix.
     d_model: int = 256             # embedding dim
-    d_state: int = 32              # N: state dim (Mamba-3 needs N/2 vs M2 for same quality)
+    d_state: int = 32              # legacy field (kept for checkpoint configs)
     n_heads: int = 16              # H: filter bank width
     n_layers: int = 6              # depth
     chunk_size: int = 128          # SSD chunk (must divide T on fast path)
     dt_min: float = 0.001
     dt_max: float = 0.1
+    mimo_rank: int = 2             # R_mimo: MIMO outer-product rank (Q/K rank axis)
+    rotary_dim_divisor: int = 4    # rotated pairs = (d_model/n_heads)/divisor
 
     # Conditioning
     d_semantic: int = 128          # semantic encoder output dim
@@ -199,251 +204,368 @@ class R8FeatureExtractor(nn.Module):
 
 class Mamba3MIMOLayer(nn.Module):
     """
-    Pure-PyTorch Mamba-3 MIMO layer.
+    Pure-PyTorch Mamba-3 MIMO layer — Way 2B (arXiv:2603.15569 formulation,
+    matching mamba3/mamba/tests/ops/tilelang/test_mamba3_mimo.py::
+    mamba3_MIMO_step_ref) + Way 2C chunked parallel scan.
 
-    Three innovations from arXiv 2603.15569:
-      1. Exponential-trapezoidal discretization (2nd-order, bilinear-like)
-      2. Complex-valued state (poles on complex plane = resonant bandpass heads)
-      3. MIMO: B,C matrices operate on R-dim input vector per head
+    The official Mamba-3 MIMO recurrence (per head h, step t):
 
-    No causal_conv1d dependency (Mamba-3 drops the short conv entirely).
-    No Triton kernels. Runs on any PyTorch backend incl. ROCm gfx1103.
+      1. Data-dependent rotary angle state — the paper's complex-valued state
+         transitions in their data-dependent-RoPE equivalent form:
+              θ_t = θ_{t-1} + π · tanh(Angles_t) · Δ_t
+         Q_t and K_t are rotated by θ_t (rotary_dim_divisor of the head_dim).
 
-    Filter-bank interpretation:
-      - Each of H heads = damped oscillator (bandpass filter)
-      - Center freq controlled by Im(A_t), bandwidth by Re(A_t)
-      - Both modulated per-timestep by input x_t via Δ_t
-      - MIMO B/C: R input channels couple to N-dim complex state
+      2. Exponential-trapezoidal discretization: the state update mixes the
+         PREVIOUS key/value outer product (trapezoidal lag term β) with the
+         current one (γ), under α_t = exp(Δ_t · A_h) decay (A_h < 0 learnable):
+              S_t = α_t·S_{t-1} + β_t·(K_{t-1} ⊗ V_{t-1}) + γ_t·(K_t ⊗ V_t)
+              β_t = (1 − σ(τ_t))·Δ_t·α_t,    γ_t = σ(τ_t)·Δ_t
+         No causal_conv1d anywhere — Mamba-3 drops the short conv.
 
-    Memory: O(B * H * N) constant (SSM, not attention).
+      3. Rank-R_mimo MIMO: Q/K carry an mimo_rank axis; V and Z are per-rank
+         gain copies (MIMO_V / MIMO_Z of shape (H, R, D)); the readout sums
+         ranks with MIMO_O and applies the D skip + Swish gate z·σ(z):
+              out_t = MIMO_O · Σ_r [ S_t·Q_t + D·V_t ] ⊙ swish(Z_t)
+
+    x_r8 (the R=8 structured spectral features) enters as additive input
+    coupling on the K and V streams (the B/C-bias role that subsumes conv),
+    so the layer keeps its (x, x_r8, cond) interface.
+
+    Scan paths (identical math — smoke_test §12 asserts parity):
+      - _scan_sequential: per-step loop, a direct transcription of
+        mamba3_MIMO_step_ref (always available, reference semantics).
+      - _scan_chunked:    Way 2C — parallel prefix inside small chunks
+        (angle cumsum + lower-triangular decay GEMM): T/C Python steps
+        instead of T, everything else batched matmul/cumsum. Same state
+        carry semantics at chunk boundaries (K/V/θ/S all carried).
+
+    Gradient checkpointing (self.gradient_checkpointing, set by train.py):
+      the layer body recomputes activations in backward when enabled.
     """
 
     def __init__(self, cfg: TrackProcessorConfig):
         super().__init__()
         self.H = cfg.n_heads
-        self.N = cfg.d_state        # complex state dim per head
+        self.Rm = cfg.mimo_rank              # MIMO outer-product rank
         self.d = cfg.d_model
-        self.R = cfg.R
-        self.chunk_size = cfg.chunk_size
-
-        head_dim = cfg.d_model // cfg.n_heads
-        assert head_dim * cfg.n_heads == cfg.d_model, \
+        self.head_dim = cfg.d_model // cfg.n_heads
+        assert self.head_dim * cfg.n_heads == cfg.d_model, \
             "d_model must be divisible by n_heads"
-        self.head_dim = head_dim
+        D = self.head_dim
+        self.n_angles = max(2, (D // cfg.rotary_dim_divisor) // 2 * 2)  # even, ≤ D//2-ish
 
-        # --- Input projection (replaces short conv of Mamba-1/2) ---
-        # Projects d_model → [x_inner, dt, BCgate] for all heads
-        # No conv: Mamba-3 uses bias on B/C instead
-        self.in_proj = nn.Linear(cfg.d_model, cfg.d_model * 2 + cfg.n_heads, bias=False)
-
-        # --- Complex SSM parameters ---
-        # A: real part (decay), imaginary part (frequency) per head
-        # Initialize: small negative real (stable), uniform imaginary (spread bands)
-        log_a_real = torch.zeros(cfg.n_heads)
-        a_imag = torch.linspace(0, math.pi, cfg.n_heads + 1)[:-1]  # spread 0..π
-        self.log_a_real = nn.Parameter(log_a_real)   # unconstrained; exp → negative
-        self.a_imag     = nn.Parameter(a_imag)        # imaginary part (frequency)
-
-        # --- MIMO B and C projections ---
-        # B: R → N (input coupling, complex)
-        # C: N → head_dim (readout, complex)
-        self.B_proj = nn.Linear(cfg.R, cfg.d_state * 2, bias=True)   # *2 for real+imag
-        self.C_proj = nn.Linear(cfg.d_state * 2, self.head_dim, bias=False)
-
-        # --- Δ (step size) projection: d_model → n_heads ---
-        self.dt_proj  = nn.Linear(cfg.d_model, cfg.n_heads, bias=True)
-        self.dt_bias  = nn.Parameter(torch.full((cfg.n_heads,), -4.0))  # softplus(-4)≈0.018
+        # --- Δ (step size), trap mixture τ, and angle increments ---
+        self.dt_proj    = nn.Linear(cfg.d_model, self.H, bias=True)
+        self.dt_bias    = nn.Parameter(torch.full((self.H,), -2.0))
+        self.trap_proj  = nn.Linear(cfg.d_model, self.H, bias=True)
+        self.angle_proj = nn.Linear(cfg.d_model, self.H * self.n_angles, bias=True)
         self.log_dt_min = math.log(cfg.dt_min)
         self.log_dt_max = math.log(cfg.dt_max)
+
+        # --- Rank-R_mimo Q/K/V/Z projections (x + x_r8 input coupling) ---
+        qk_dim = self.Rm * self.H * D
+        self.q_proj = nn.Linear(cfg.d_model, qk_dim, bias=False)
+        self.k_proj = nn.Linear(cfg.d_model, qk_dim, bias=False)
+        self.k_r8   = nn.Linear(cfg.R, qk_dim, bias=True)     # x_r8 → K stream
+        self.v_proj = nn.Linear(cfg.d_model, self.H * D, bias=False)
+        self.v_r8   = nn.Linear(cfg.R, self.H * D, bias=True) # x_r8 → V stream
+        self.z_proj = nn.Linear(cfg.d_model, self.H * D, bias=False)
+
+        # --- MIMO per-rank gains + D skip (per head) ---
+        self.MIMO_V = nn.Parameter(torch.randn(self.H, self.Rm, D) / math.sqrt(D))
+        self.MIMO_Z = nn.Parameter(torch.randn(self.H, self.Rm, D) / self.Rm)
+        self.MIMO_O = nn.Parameter(torch.randn(self.H, self.Rm, D) / self.Rm)
+        self.D_skip = nn.Parameter(torch.zeros(self.H))
+
+        # --- Decay poles: A_h = -exp(log_a_real) < 0 (per head) ---
+        self.log_a_real = nn.Parameter(torch.zeros(self.H))
 
         # --- Output ---
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.norm     = nn.LayerNorm(cfg.d_model)
         self.drop     = nn.Dropout(cfg.dropout)
 
-        # --- Activation-memory control (honored by forward; set by train.py) ---
-        # When True during training, the layer body is wrapped in
-        # torch.utils.checkpoint (non-reentrant) so activations are recomputed
-        # in backward instead of stored. ~20% slower, much lower peak VRAM.
+        # --- Activation-memory control (honored; set by train.py) ---
         self.gradient_checkpointing = False
 
-        # --- FiLM conditioning projections (eagerly initialized) ---
-        # Initialized so γ ≈ 0, β ≈ 0 → layer starts as identity in cond pathway.
-        # This is the standard FiLM init trick: model behaves as plain Mamba3
-        # at step 0, conditioning influence grows during training.
+        # --- FiLM conditioning (zero-init: identity at step 0) ---
         self.film_proj    = nn.Linear(cfg.d_cond, cfg.d_model * 2, bias=True)
-        self.dt_film_proj = nn.Linear(cfg.d_cond, cfg.n_heads * 2, bias=True)
+        self.dt_film_proj = nn.Linear(cfg.d_cond, self.H * 2, bias=True)
         with torch.no_grad():
             self.film_proj.weight.zero_()
             self.film_proj.bias.zero_()
             self.dt_film_proj.weight.zero_()
             self.dt_film_proj.bias.zero_()
 
-    def _discretize_trapezoidal(
-        self, a_real: Tensor, a_imag: Tensor, dt: Tensor
-    ) -> tuple[Tensor, Tensor]:
+        # Way 2C chunk length: small enough that the (C×C) decay matrices
+        # stay tiny and exp() spreads stay in fp32 range, large enough to cut
+        # Python loop overhead ~16× vs the per-step scan.
+        self.scan_chunk = min(16, max(2, cfg.chunk_size // 8))
+        self.use_chunked = True
+
+    # ------------------------------------------------------------------ #
+    # Rotary helper (from mamba3_MIMO_step_ref::apply_rotary_emb)         #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _rotate(tensor: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         """
-        Exponential-trapezoidal discretization (Mamba-3 innovation #1).
-        Equivalent to bilinear (Tustin) transform for continuous→discrete.
-
-        Continuous: dh/dt = (α + jω) h + B x
-        Trapezoidal: h_t = A_d h_{t-1} + B_d x_t
-          A_d = (1 + Δ(α+jω)/2) / (1 - Δ(α+jω)/2)
-          B_d = Δ / (1 - Δ(α+jω)/2)
-
-        This maps left-half s-plane exactly to unit disk (stable by construction
-        for α < 0), preserving frequency response shape. Compare ZOH (Mamba-1/2)
-        which has frequency warping at high freqs — critical for 44.1 kHz audio.
-
-        a_real: (H,) — negative decay rates
-        a_imag: (H,) — oscillation frequencies
-        dt:     (B, T, H) — per-step discretization
-
-        returns: A_d (B, T, H) complex, B_d_scale (B, T, H) complex
+        tensor: (B, H, R, D)  cos/sin: (B, H, 1, A) with A ≤ D//2.
+        Rotates the first A complex pairs; remaining pairs pass through
+        (cos padded to 1.0, sin padded to 0.0).
         """
-        # Continuous eigenvalue: α + jω, shape (H,)
-        a_cont = torch.complex(
-            -torch.exp(a_real),  # force negative real part (stable)
-            a_imag
-        )  # (H,)
+        t = tensor.view(*tensor.shape[:-1], -1, 2)
+        t0 = t[..., 0]
+        t1 = t[..., 1]
+        if cos.shape[-1] < t0.shape[-1]:
+            pad = t0.shape[-1] - cos.shape[-1]
+            cos = F.pad(cos, (0, pad), value=1.0)
+            sin = F.pad(sin, (0, pad), value=0.0)
+        r0 = t0 * cos - t1 * sin
+        r1 = t0 * sin + t1 * cos
+        return torch.stack([r0, r1], dim=-1).view_as(tensor)
 
-        # Broadcast dt: (B, T, H)
-        half_dt_a = dt.unsqueeze(-1) * a_cont / 2  # will broadcast: (B,T,H)
-        # NOTE: dt is real, a_cont is complex → result is complex
-        half_dt_a = torch.complex(
-            dt * (-torch.exp(a_real)) / 2,
-            dt * a_imag / 2
-        )  # (B, T, H) complex
+    def _init_state(self, B: int, device, ref: Tensor):
+        D = self.head_dim
+        return (
+            torch.zeros(B, self.H, self.n_angles, device=device, dtype=ref.dtype),
+            torch.zeros(B, self.H, D, D, device=device, dtype=ref.dtype),      # S (B,H,P,D)
+            torch.zeros(B, self.H, self.Rm, D, device=device, dtype=ref.dtype),  # K state
+            torch.zeros(B, self.H, self.Rm, D, device=device, dtype=ref.dtype),  # V state
+        )
 
-        numerator   = 1 + half_dt_a
-        denominator = 1 - half_dt_a
-
-        A_d = numerator / denominator          # (B, T, H) complex, |A_d| ≤ 1
-        B_d_scale = dt / denominator           # (B, T, H) complex
-
-        return A_d, B_d_scale
-
-    def _ssm_scan_sequential(
+    # ------------------------------------------------------------------ #
+    # Scan path 1: sequential reference (mamba3_MIMO_step_ref)            #
+    # ------------------------------------------------------------------ #
+    def _scan_sequential(
         self,
-        x_r8: Tensor,      # (B, T, R) — R=8 features (MIMO input)
-        A_d:  Tensor,      # (B, T, H) complex
-        B_d:  Tensor,      # (B, T, H) complex — scaling factor
-        dt:   Tensor,      # (B, T, H) — for B_d application
-    ) -> Tensor:
-        """
-        Sequential SSM scan. O(T) sequential, O(H*N) memory.
-        Slow but correct and ROCm-safe. Replace with parallel scan
-        when/if ROCm kernel is available.
+        q: Tensor, k: Tensor, v: Tensor, z: Tensor,     # (B,T,Rm,H,D) / (B,T,H,D)
+        dt: Tensor, trap_raw: Tensor, angles: Tensor,   # (B,T,H) / (B,T,H,A)
+        state=None,
+    ) -> tuple[Tensor, tuple]:
+        B, T, Rm, H, D = q.shape
+        if state is None:
+            theta, S, Kst, Vst = self._init_state(B, q.device, q)
+        else:
+            theta, S, Kst, Vst = (s.clone() for s in state)
 
-        Returns: (B, T, H, head_dim) — output sequence
-        """
-        B_batch, T, R = x_r8.shape
-        H, N = self.H, self.N
-
-        # MIMO B: project R → N complex per head (shared across heads for now)
-        bc = self.B_proj(x_r8)                         # (B, T, N*2)
-        B_real, B_imag = bc.chunk(2, dim=-1)           # (B, T, N) each
-        B_vec = torch.complex(B_real, B_imag)          # (B, T, N) complex
-
-        # Initialize hidden state (complex)
-        h = torch.zeros(B_batch, H, N, dtype=torch.complex64, device=x_r8.device)
-
-        outputs = []
+        A_decay = -torch.exp(self.log_a_real)            # (H,) negative poles
+        outs = []
         for t in range(T):
-            # A_d_t: (B, H) complex, B_d_t: (B, H) complex
-            A_d_t = A_d[:, t, :]   # (B, H)
-            B_d_t = B_d[:, t, :]   # (B, H)
+            dt_t = dt[:, t]                              # (B, H)
+            trap_t = torch.sigmoid(trap_raw[:, t])       # (B, H)
 
-            # State update: h = A_d * h + B_d * (B_vec * x)
-            # B_d_t: (B, H) → (B, H, 1), B_vec_t: (B, N) → (B, 1, N)
-            B_input = B_d_t.unsqueeze(-1) * B_vec[:, t, :].unsqueeze(1)  # (B, H, N)
-            h = A_d_t.unsqueeze(-1) * h + B_input      # (B, H, N) complex
+            # 1. Data-dependent rotary angle state
+            theta = theta + torch.tanh(angles[:, t]) * dt_t.unsqueeze(-1) * math.pi
+            cos = torch.cos(theta).unsqueeze(2)          # (B, H, 1, A)
+            sin = torch.sin(theta).unsqueeze(2)
 
-            # Readout: C projects complex state → real head_dim
-            h_cat = torch.cat([h.real, h.imag], dim=-1)   # (B, H, N*2)
-            y_t = self.C_proj(h_cat)                        # (B, H, head_dim)
-            outputs.append(y_t)
+            q_t = self._rotate(q[:, t].permute(0, 2, 1, 3), cos, sin)  # (B,H,Rm,D)
+            k_t = self._rotate(k[:, t].permute(0, 2, 1, 3), cos, sin)
 
-        out = torch.stack(outputs, dim=1)               # (B, T, H, head_dim)
-        return out
+            # Rank projections (per-rank gain copies of V/Z)
+            v_rank = torch.einsum('bhd,hrd->bhrd', v[:, t], self.MIMO_V)  # (B,H,Rm,D)
+            z_rank = torch.einsum('bhd,hrd->bhrd', z[:, t], self.MIMO_Z)
 
+            # 2. Exponential-trapezoidal state update
+            alpha = torch.exp(dt_t * A_decay)            # (B, H)
+            beta  = (1.0 - trap_t) * dt_t * alpha
+            gamma = trap_t * dt_t
+
+            prev_kv = torch.einsum('bhrd,bhrp->bhpd', Kst, Vst)
+            curr_kv = torch.einsum('bhrd,bhrp->bhpd', k_t, v_rank)
+            S = (alpha.unsqueeze(-1).unsqueeze(-1) * S
+                 + beta.unsqueeze(-1).unsqueeze(-1) * prev_kv
+                 + gamma.unsqueeze(-1).unsqueeze(-1) * curr_kv)
+
+            # 3. Rank-R readout + D skip + Swish gate + MIMO_O
+            out = torch.einsum('bhpd,bhrd->bhrp', S, q_t)          # (B,H,Rm,P)
+            out = out + self.D_skip[None, :, None, None] * v_rank
+            out = out * z_rank * torch.sigmoid(z_rank)
+            out = torch.einsum('bhrp,hrp->bhp', out, self.MIMO_O)  # (B,H,P)
+
+            outs.append(out)
+            Kst = k_t
+            Vst = v_rank
+
+        return torch.stack(outs, dim=1), (theta, S, Kst, Vst)
+
+    # ------------------------------------------------------------------ #
+    # Scan path 2: Way 2C chunked parallel scan                           #
+    # ------------------------------------------------------------------ #
+    def _scan_chunked(
+        self,
+        q: Tensor, k: Tensor, v: Tensor, z: Tensor,
+        dt: Tensor, trap_raw: Tensor, angles: Tensor,
+        state=None,
+    ) -> tuple[Tensor, tuple]:
+        """
+        Identical recurrence to _scan_sequential, parallelized within
+        chunks of scan_chunk steps:
+          - angle state: cumsum (purely additive → trivially parallel)
+          - S recurrence: S_t = α_t·S_{t-1} + u_t with scalar α per (B,H)
+            solved inside the chunk by a lower-triangular decay GEMM:
+            W[t,k] = exp(g_t − g_{k−1}) (g = within-chunk cumsum of log α),
+            plus the carried S at the chunk boundary scaled by exp(g_t).
+          - readout per chunk, batched over the chunk's steps.
+        Chunk boundaries carry (θ, S, K, V) exactly like per-step updates.
+        """
+        B, T, Rm, H, D = q.shape
+        if state is None:
+            theta, S, Kst, Vst = self._init_state(B, q.device, q)
+        else:
+            theta, S, Kst, Vst = (s.clone() for s in state)
+
+        A_decay = -torch.exp(self.log_a_real)            # (H,)
+        C = self.scan_chunk
+        outs = []
+
+        for t0 in range(0, T, C):
+            t1 = min(t0 + C, T)
+            Lc = t1 - t0
+
+            dt_c = dt[:, t0:t1]                          # (B, L, H)
+            trap_c = torch.sigmoid(trap_raw[:, t0:t1])   # (B, L, H)
+            ang_c = angles[:, t0:t1]                     # (B, L, H, A)
+
+            # ── 1. Angle state: within-chunk cumsum + carry ──
+            inc = torch.tanh(ang_c) * dt_c.unsqueeze(-1) * math.pi   # (B,L,H,A)
+            theta_seq = theta.unsqueeze(1) + torch.cumsum(inc, dim=1)
+            theta = theta_seq[:, -1]
+            # layout (B, H, L, 1, A) to broadcast over the rank axis of
+            # the (B, H, L, Rm, D) tensors below
+            cos = torch.cos(theta_seq).permute(0, 2, 1, 3).unsqueeze(3)
+            sin = torch.sin(theta_seq).permute(0, 2, 1, 3).unsqueeze(3)
+
+            # ── Rotate + rank projections over the whole chunk ──
+            # per-rank layout: (B, H, L, Rm, D)
+            q_c = self._rotate(q[:, t0:t1].permute(0, 3, 1, 2, 4), cos, sin)
+            k_c = self._rotate(k[:, t0:t1].permute(0, 3, 1, 2, 4), cos, sin)
+            v_c = torch.einsum('bhld,hrd->bhlrd',
+                               v[:, t0:t1].permute(0, 2, 1, 3), self.MIMO_V)
+            z_c = torch.einsum('bhld,hrd->bhlrd',
+                               z[:, t0:t1].permute(0, 2, 1, 3), self.MIMO_Z)
+
+            # ── 2. Trapezoidal input terms ──
+            prev_kv = torch.einsum(
+                'bhlrd,bhlrp->bhlpd',
+                torch.cat([Kst.unsqueeze(2), k_c[:, :, :-1]], dim=2),
+                torch.cat([Vst.unsqueeze(2), v_c[:, :, :-1]], dim=2),
+            )                                            # (B,H,L,P,D)
+            curr_kv = torch.einsum('bhlrd,bhlrp->bhlpd', k_c, v_c)
+
+            alpha = torch.exp(dt_c * A_decay)            # (B, L, H)
+            beta  = (1.0 - trap_c) * dt_c * alpha
+            gamma = trap_c * dt_c
+            u = (beta.permute(0, 2, 1)[:, :, :, None, None] * prev_kv
+                 + gamma.permute(0, 2, 1)[:, :, :, None, None] * curr_kv)  # (B,H,L,P,D)
+
+            # ── Triangular decay GEMM scan within the chunk ──
+            # S_t = α_t·S_{t-1} + u_t  ⇒  u_k enters S_t with weight
+            # Π_{i=k+1..t} α_i = exp(g_t − g_k)  (unit diagonal, k = t),
+            # and the carry S_{t0-1} enters with weight exp(g_t) (g_{-1} = 0).
+            la = (dt_c * A_decay).permute(0, 2, 1)       # (B, H, L) log α
+            g = torch.cumsum(la, dim=2)                  # (B, H, L)
+            logW = g.unsqueeze(-1) - g.unsqueeze(-2)     # (B,H,L_t,L_k)
+            W = torch.tril(torch.exp(logW))              # (B,H,L,L)
+
+            u_flat = u.reshape(B, H, Lc, D * D)          # (B,H,L,P*D)
+            S_flat = torch.einsum('bhik,bhkp->bhip', W, u_flat)
+            S_seq = S_flat.reshape(B, H, Lc, D, D)
+            # carry-in: S at chunk start, decayed to each step
+            S_seq = S_seq + torch.exp(g)[:, :, :, None, None] * S.unsqueeze(2)
+            S = S_seq[:, :, -1]
+
+            # ── 3. Readout over the chunk ──
+            out = torch.einsum('bhlpd,bhlrd->bhlrp', S_seq, q_c)   # (B,H,L,Rm,P)
+            out = out + self.D_skip[None, :, None, None, None] * v_c
+            out = out * z_c * torch.sigmoid(z_c)
+            out = torch.einsum('bhlrp,hrp->bhlp', out, self.MIMO_O)  # (B,H,L,P)
+            outs.append(out.permute(0, 2, 1, 3))         # → (B, L, H, P)
+
+            Kst = k_c[:, :, -1]
+            Vst = v_c[:, :, -1]
+
+        return torch.cat(outs, dim=1), (theta, S, Kst, Vst)
+
+    # ------------------------------------------------------------------ #
+    # Forward                                                             #
+    # ------------------------------------------------------------------ #
     def forward(
         self,
         x: Tensor,           # (B, T, d_model) — track embedding
-        x_r8: Tensor,        # (B, T, R=8) — raw structured features (MIMO input)
-        cond: Optional[Tensor] = None,  # (B, T, d_cond) — FiLM conditioning
-    ) -> Tensor:
+        x_r8: Tensor,        # (B, T, R=8) — raw structured features (input coupling)
+        cond: Optional[Tensor] = None,   # (B, T, d_cond) — FiLM conditioning
+        state: Optional[tuple] = None,   # recurrent state carry-in (streaming)
+        return_state: bool = False,
+    ) -> Tensor | tuple[Tensor, tuple]:
         """
-        Returns: (B, T, d_model)
+        Returns: (B, T, d_model), or (output, state) when return_state=True.
 
         If ``self.gradient_checkpointing`` is True and gradients are enabled,
-        the body runs under ``torch.utils.checkpoint.checkpoint`` so training
-        recomputes activations in backward instead of storing them (set
-        ``layer.gradient_checkpointing = True`` from the training loop; the
-        ``--no-grad-ckpt`` CLI flag disables it).
+        the body runs under ``torch.utils.checkpoint`` (non-reentrant) so
+        training recomputes activations in backward. The streaming path
+        (state carry) skips checkpointing.
         """
-        if self.training and self.gradient_checkpointing and torch.is_grad_enabled():
-            # cond may be None; non-tensor args pass through non-reentrant
-            # checkpointing unchanged.
+        if (self.training and self.gradient_checkpointing and torch.is_grad_enabled()
+                and state is None and not return_state):
             return torch.utils.checkpoint.checkpoint(
                 self._forward_impl, x, x_r8, cond, use_reentrant=False
             )
-        return self._forward_impl(x, x_r8, cond)
+        return self._forward_impl(x, x_r8, cond, state=state, return_state=return_state)
 
     def _forward_impl(
         self,
-        x: Tensor,           # (B, T, d_model) — track embedding
-        x_r8: Tensor,        # (B, T, R=8) — raw structured features (MIMO input)
-        cond: Optional[Tensor] = None,  # (B, T, d_cond) — FiLM conditioning
-    ) -> Tensor:
-        """
-        Returns: (B, T, d_model)
-        """
+        x: Tensor,
+        x_r8: Tensor,
+        cond: Optional[Tensor] = None,
+        state: Optional[tuple] = None,
+        return_state: bool = False,
+    ):
         B, T, D = x.shape
         residual = x
 
-        # --- FiLM on input (from cross-track conditioning) ---
+        # --- FiLM on input (session / cross-track conditioning) ---
         if cond is not None:
-            gamma_beta = self.film_proj(cond)            # (B, T, D*2)
+            gamma_beta = self.film_proj(cond)             # (B, T, D*2)
             gamma, beta = gamma_beta.chunk(2, dim=-1)
             x = x * (1 + gamma) + beta
 
-        # --- Δ projection (input-dependent step size) ---
-        dt_raw = self.dt_proj(x)                        # (B, T, H)
-
-        # FiLM on Δ from conditioning (modulates pole location per timestep)
+        # --- Δ, trap τ, angle increments ---
+        dt_raw = self.dt_proj(x)                          # (B, T, H)
         if cond is not None:
-            dt_gamma_beta = self.dt_film_proj(cond)     # (B, T, H*2)
+            dt_gamma_beta = self.dt_film_proj(cond)       # (B, T, H*2)
             dt_gamma, dt_beta = dt_gamma_beta.chunk(2, dim=-1)
             dt_raw = dt_raw * (1 + dt_gamma) + dt_beta
+        dt = F.softplus(dt_raw + self.dt_bias)
+        dt = dt.clamp(min=math.exp(self.log_dt_min), max=math.exp(self.log_dt_max))
 
-        # Clamp Δ to [dt_min, dt_max] via softplus + clamp
-        dt = F.softplus(dt_raw + self.dt_bias)          # (B, T, H)
-        dt = dt.clamp(
-            min=math.exp(self.log_dt_min),
-            max=math.exp(self.log_dt_max)
-        )
+        trap_raw = self.trap_proj(x)                      # (B, T, H)
+        angles   = self.angle_proj(x).view(B, T, self.H, self.n_angles)
 
-        # --- Trapezoidal discretization + MIMO scan ---
-        # Force fp32: torch.complex() does not support bf16/fp16. Even under
-        # bf16 autocast, the SSM recurrence must compute in fp32 for stability
-        # (complex pole arithmetic is precision-sensitive).
+        # --- Rank-R_mimo Q/K/V/Z (x + x_r8 input coupling on K/V) ---
+        q = self.q_proj(x).view(B, T, self.Rm, self.H, self.head_dim)
+        k = (self.k_proj(x) + self.k_r8(x_r8)).view(B, T, self.Rm, self.H, self.head_dim)
+        v = (self.v_proj(x) + self.v_r8(x_r8)).view(B, T, self.H, self.head_dim)
+        z = self.z_proj(x).view(B, T, self.H, self.head_dim)
+
+        # --- Scan in fp32 (rotary + decay math is precision-sensitive) ---
         with torch.autocast(device_type=x.device.type, enabled=False):
-            dt_fp32 = dt.float()
-            x_r8_fp32 = x_r8.float()
-            A_d, B_d_scale = self._discretize_trapezoidal(
-                self.log_a_real.float(), self.a_imag.float(), dt_fp32
-            )
-            out = self._ssm_scan_sequential(x_r8_fp32, A_d, B_d_scale, dt_fp32)
-
-        # Restore outer dtype for the rest of the layer
-        out = out.to(x.dtype)
-        out = out.reshape(B, T, D)                      # (B, T, d_model)
+            q_f, k_f, v_f, z_f = (t.float() for t in (q, k, v, z))
+            dt_f, trap_f, ang_f = (t.float() for t in (dt, trap_raw, angles))
+            args = (q_f, k_f, v_f, z_f, dt_f, trap_f, ang_f)
+            if self.use_chunked:
+                out, new_state = self._scan_chunked(*args, state=state)
+            else:
+                out, new_state = self._scan_sequential(*args, state=state)
 
         # --- Output projection + residual ---
+        out = out.reshape(B, T, D).to(residual.dtype)     # (B, T, d_model)
         out = self.out_proj(out)
         out = self.drop(out)
-        return self.norm(out + residual)
+        out = self.norm(out + residual)
+        if return_state:
+            return out, new_state
+        return out
 
 
 # ---------------------------------------------------------------------------

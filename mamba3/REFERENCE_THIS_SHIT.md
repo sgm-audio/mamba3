@@ -240,3 +240,43 @@ python compiler/fit_profile.py --data <client_features_dir> --profile-out profil
 cargo test --manifest-path core/Cargo.toml
 cargo check --manifest-path plugin/Cargo.toml && cargo xtask bundle cynical-engineer
 ```
+
+---
+
+## 12. Way 2B + 2C: Mamba-3 MIMO recurrence rewrite (2026-10-04)
+
+`mamba3/model.py::Mamba3MIMOLayer` now implements the **official arXiv:2603.15569
+MIMO formulation** (matching `mamba3/mamba/tests/ops/tilelang/test_mamba3_mimo.py::
+mamba3_MIMO_step_ref`):
+
+1. **Data-dependent rotary angle state** — θ_t = θ_{t-1} + π·tanh(Angles_t)·Δ_t
+   applied to Q/K (the paper's complex-valued transitions in RoPE form).
+2. **Exponential-trapezoidal update** — S_t = α_t·S_{t-1} + β_t·(K_{t-1}⊗V_{t-1})
+   + γ_t·(K_t⊗V_t) with α_t = exp(Δ_t·A_h), β_t = (1−σ(τ_t))·Δ_t·α_t,
+   γ_t = σ(τ_t)·Δ_t. The previous-step K/V outer product (trapezoidal lag term)
+   replaces the old bilinear filterbank; `x_r8` enters as additive K/V coupling.
+3. **Rank-R_mimo MIMO** (`cfg.mimo_rank`, default 2) — per-rank Q/K axis,
+   MIMO_V/MIMO_Z gain copies, MIMO_O readout, D skip + Swish z·σ(z) gate.
+
+**Way 2C**: `_scan_chunked` parallelizes the recurrence inside 16-step chunks
+(angle cumsum + lower-triangular decay GEMM), cutting Python loop overhead
+~16× vs the per-step reference scan. `layer.use_chunked = False` selects the
+verbatim sequential reference. Recurrent state carry (θ, S, K, V) is exposed
+via `forward(..., state=, return_state=)` for future streaming (Way 4A).
+
+### Resolved audit findings (from §11)
+- ✅ `in_proj` dead parameters: removed — Q/K/V/Z projections all live and
+  gradient-verified (log_a_real, MIMO_V/O, q_proj, k_r8, angle_proj, trap_proj
+  all receive grads with and without checkpointing).
+- ✅ Hidden state `x` now drives the full recurrence (Q/K/V/Z are projections
+  of `x`; `x_r8` couples additively into K/V).
+
+### Verification (run 2026-10-04, torch 2.14.1 CPU)
+| Gate | Result |
+|------|--------|
+| Scan parity chunked vs sequential (T=77, non-multiple of chunk) | max Δ **3.6e-7** |
+| State-carry streaming vs full-window | max Δ **4.8e-7** |
+| End-state equality across scan paths | max Δ **1.0e-6** |
+| `smoke_test.py --device cpu` (13 sections incl. [10][11][12]) | **0 failures** |
+| `test_smoke.py --device cpu` (9 sections incl. [9]) | **9/9 passed** |
+| `train.py` micro-run (6 steps, --grad-accum 2, synthetic 4-track set) | all 3 phases entered; logs ONLY at optimizer steps 2/4/6; validation + best.pt + resume-from-checkpoint OK |
