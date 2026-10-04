@@ -255,7 +255,7 @@ def main():
     print(f"Found {len(tracks)} tracks under {root}")
     print(f"CREPE model: {args.model}")
     print(f"Device: {args.device}")
-    print(f"Output: <stem>.crepe.npy (fp16) + <stem>.pitched.npy alongside each WAV")
+    print("Output: <stem>.crepe.npy (fp16) + <stem>.pitched.npy alongside each WAV")
     print("─" * 60)
 
     # Device setup

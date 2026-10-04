@@ -18,9 +18,10 @@
 - `train.py --grad-accum N` for gradient accumulation (effective batch = batch × N).
 
 ## Smoke tests
-- `mamba3/smoke_test.py` (793 lines, full) — referenced by `run_smoke_test.ps1`.
-- `mamba3/test_smoke.py` (764 lines, reduced) — referenced by training docs.
-- Both exist; docs reference `test_smoke.py`, scripts reference `smoke_test.py`.
+- `mamba3/smoke_test.py` (full, 12 sections incl. Way 2C scan parity) — run by `run_smoke_test.ps1`.
+- `mamba3/test_smoke.py` (reduced, 10 sections) — run by `run_smoke_test.sh`, referenced by training docs.
+- Both exist and both must pass; both exit non-zero on failure. CI runs both on CPU (`.github/workflows/ci.yml`).
+- Edge-controller regression tests: `python mamba3/edge_dsp_meta_prompt/compiler/test_controller.py`.
 
 ## File layout
 ```
@@ -31,8 +32,12 @@ mamba3/
   run_smoke_test.ps1 — Windows smoke test launcher
   model.py           — Mamba-3 MIMO architecture (Pure PyTorch)
   train.py           — 3-phase training loop (100k steps default)
-  smoke_test.py      — 9-section pre-training smoke test
-  test_smoke.py      — alternative smoke test (7 sections)
+  smoke_test.py      — 12-section pre-training smoke test
+  test_smoke.py      — reduced smoke test (10 sections)
+  degrade.py         — Recipe 1A synthetic degradation pipeline
+  extract_crepe.py   — offline CREPE f0 extraction
+  requirements.txt   — training deps (install torch for your accelerator first)
+  run_train.sh / run_smoke_test.sh — Linux launchers (expect ./.venv; see TRAINING_UBUNTU.md status note)
   TRAINING.md        — Linux (Bazzite/ROCm) workflow
   TRAINING_WINDOWS.md — Windows workflow
   edge_dsp_meta_prompt/ — separate Rust+Python ONNX export toolchain
@@ -46,5 +51,5 @@ mamba3/
 - `torch.cuda.is_available()` returns True on ROCm (API-compat layer, not real CUDA).
 
 ## Testing
-- No formal test framework — smoke tests (`smoke_test.py` / `test_smoke.py`) are the gate.
+- No pytest suite — smoke tests (`smoke_test.py` / `test_smoke.py`) plus `compiler/test_controller.py` are the gate; `ruff check .` (pyflakes rules only, see `ruff.toml`) is the lint gate.
 - Run smoke test before training: `python smoke_test.py --device cuda` (venv activated).

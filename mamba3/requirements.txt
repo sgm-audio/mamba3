@@ -1,0 +1,11 @@
+# Training / smoke-test dependencies for the Mamba-3 per-track processor.
+#
+# Install PyTorch FIRST from the index that matches your accelerator
+# (see TRAINING_WINDOWS.md for the ROCm gfx1152 wheels, runpod_guide.md for
+# CUDA pods), then:  pip install -r requirements.txt
+torch>=2.1
+torchaudio>=2.1
+numpy>=1.22
+soundfile>=0.12        # WAV loading (avoids the torchaudio/torchcodec backend chain)
+auraloss>=0.4          # multi-resolution STFT loss (optional: train.py falls back to single-res L1)
+torchcrepe>=0.0.20     # only needed by extract_crepe.py (offline f0 extraction)

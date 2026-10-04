@@ -9,12 +9,21 @@
 //!            hidden_state_in (1,3,64)
 //!   outputs: dsp_parameters (1,32), hidden_state_out (1,3,64)
 //!
-//! Backward compatibility: the LEGACY `mamba3_controller_quant.onnx` export
-//! leaked extra unnamed inputs/outputs (`onnx::Mul_3`, `onnx::Mul_4`, ...) —
-//! a torch.onnx.export tuple-unpacking bug.  `run_step` feeds ANY extra input
-//! declared by the graph with zeros and reads outputs BY NAME, so the worker
-//! runs correctly against both the legacy artifact and the clean re-export
-//! produced by `compiler/train_controller.py --export`.
+//! Backward compatibility (CAVEAT): the LEGACY `mamba3_controller_quant.onnx`
+//! export leaked extra unnamed inputs/outputs (`onnx::Mul_3`, `onnx::Mul_4`, ...)
+//! — a torch.onnx.export tuple-unpacking bug.  `run_step` zero-fills any extra
+//! declared input and reads outputs BY NAME, which covers the leaked tensors.
+//! It does NOT cover the legacy artifact's different *shapes*: that graph
+//! declares `observer_features [1,100,12]` and `hidden_state_in [1,64]`, while
+//! this worker supplies 12 and 192 floats respectively, so
+//! `Tensor::from_array` errors on every tick and the plugin stays on neutral
+//! params (the error is swallowed by `if let Ok(..)` in `run_worker`).  The
+//! worker is therefore only correct against the clean 5A re-export from
+//! `compiler/train_controller.py --export`.  `ControllerWorker::new` now
+//! validates the declared element counts of the three contract inputs up
+//! front and refuses to start (with a message naming the offending tensor)
+//! instead of failing silently on every tick, and `run_worker` logs the first
+//! `run_step` error it sees.
 //!
 //! This file runs on a normal thread: allocation and locking are fine here.
 //! Nothing in this module may ever be called from `process()`.
@@ -28,7 +37,7 @@ use edge_dsp_core::{ObserverFrame, SpscRingBuffer, TripleBuffer};
 use crate::auditor::AuditorAgent;
 use crate::plugin::{DynamicDspParams, PARAM_COUNT};
 
-/// Embed the quantized controller with the plugin binary (937 KB) so the
+/// Embed the quantized controller with the plugin binary (~136 KB) so the
 /// plugin never depends on an external file path at runtime.  Rebuild the
 /// plugin after `compiler/train_controller.py` regenerates the artifact.
 const MODEL_BYTES: &[u8] = include_bytes!("../../mamba3_controller_quant.onnx");
@@ -69,11 +78,50 @@ impl ControllerWorker {
             }
         }
 
+        // Shape contract: the element count we feed must equal the element
+        // count the graph declares (batch is symbolic → counted as 1).  The
+        // legacy artifact declares observer_features [1,100,12] (1200) and
+        // hidden_state_in [1,64] (64) and would otherwise error on every tick.
+        for input in &session.inputs {
+            let expected = match input.name.as_str() {
+                "observer_features" => OBS_DIM,
+                "session_state" => SESS_DIM,
+                "hidden_state_in" => STATE_DIM,
+                _ => continue, // leaked legacy inputs are zero-filled at their own shape
+            };
+            let declared = Self::declared_len(input);
+            if declared != expected {
+                return Err(ort::Error::new(format!(
+                    "controller ONNX input `{}` declares {} elements (shape {:?}) but the \
+                     worker feeds {} — this is the legacy export; regenerate with \
+                     compiler/train_controller.py --export",
+                    input.name, declared, Self::declared_dims(input), expected
+                )));
+            }
+        }
+
         Ok(Self {
             session,
             session_state,
             hidden: [0.0; STATE_DIM],
         })
+    }
+
+    /// Declared dims of a graph input, symbolic/unknown dims counted as 1.
+    fn declared_dims(input: &ort::session::Input) -> Vec<usize> {
+        input
+            .shape
+            .iter()
+            .map(|d| match d {
+                ort::session::InputDimensions::Fixed(n) => *n as usize,
+                ort::session::InputDimensions::Symbolic(_) => 1,
+                ort::session::InputDimensions::Unknown => 1,
+            })
+            .collect()
+    }
+
+    fn declared_len(input: &ort::session::Input) -> usize {
+        Self::declared_dims(input).iter().product::<usize>().max(1)
     }
 
     /// One recurrent step. Returns the 32 tanh-space DSP parameters.
@@ -85,15 +133,7 @@ impl ControllerWorker {
         let mut feeds: Vec<(String, ort::value::Value)> = Vec::new();
 
         for input in &self.session.inputs {
-            let dims: Vec<usize> = input
-                .shape
-                .iter()
-                .map(|d| match d {
-                    ort::session::InputDimensions::Fixed(n) => *n as usize,
-                    ort::session::InputDimensions::Symbolic(_) => 1,
-                    ort::session::InputDimensions::Unknown => 1,
-                })
-                .collect();
+            let dims = Self::declared_dims(input);
             let n: usize = dims.iter().product();
 
             let data: Vec<f32> = match input.name.as_str() {
@@ -162,6 +202,7 @@ pub fn run_worker(
         }
     };
     let auditor = AuditorAgent::new(param_buffer);
+    let mut reported_step_error = false;
 
     while !stop.load(Ordering::Relaxed) {
         let tick_start = Instant::now();
@@ -174,9 +215,19 @@ pub fn run_worker(
 
         if let Some(frame) = latest {
             let obs = pack_frame(&frame);
-            if let Ok(out) = worker.run_step(&obs) {
-                let params = DynamicDspParams::from_model_output(&out);
-                auditor.verify_and_commit(params); // clamps + TripleBuffer write
+            match worker.run_step(&obs) {
+                Ok(out) => {
+                    let params = DynamicDspParams::from_model_output(&out);
+                    auditor.verify_and_commit(params); // clamps + TripleBuffer write
+                }
+                Err(e) => {
+                    // Log once (worker thread — printing is fine here), then
+                    // keep ticking; the audio thread stays on the last params.
+                    if !reported_step_error {
+                        eprintln!("[cynical-controller] ONNX run_step failed: {e}");
+                        reported_step_error = true;
+                    }
+                }
             }
         }
 

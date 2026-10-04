@@ -267,7 +267,6 @@ class StemDataset(Dataset):
         soundfile reads WAV/FLAC/OGG natively, which covers MUSDB18-HQ.
         """
         import soundfile as sf
-        import numpy as np
 
         path = track_dir / f"{stem_name}.wav"
         if not path.exists():
@@ -732,7 +731,6 @@ def train(
                         v_other = v_batch['other_stems'].to(dev)
                         K = v_other.shape[1]
                         embs = []
-                        T_frames = 1 + v_target.shape[-1] // cfg.hop_length
                         for k in range(K):
                             v_crepe_k = v_batch['other_crepe'][:, k, :, :].to(dev)
                             out_k = model(v_other[:, k, :], v_crepe_k, other_embs=None,
@@ -765,14 +763,14 @@ def train(
     if grad_accum > 1:
         print(f"Gradient accumulation: {grad_accum} (effective batch = {batch_size * grad_accum})")
     if not grad_ckpt:
-        print(f"Gradient checkpointing: OFF (max VRAM, fastest compute)")
+        print("Gradient checkpointing: OFF (max VRAM, fastest compute)")
     print(f"Phase 1 (contrastive):  step 0       → {PHASE_1_END}")
     print(f"Phase 2 (single-track restoration): step {PHASE_1_END} → {PHASE_2_END}")
     print(f"Phase 3 (cross-track restoration):  step {PHASE_2_END} → {n_steps}")
     if degradation is not None:
-        print(f"Recipe 1A: ON — degraded input (EQ/comp/sat/reverb) → clean target")
+        print("Recipe 1A: ON — degraded input (EQ/comp/sat/reverb) → clean target")
     else:
-        print(f"Recipe 1A: OFF (--no-degrade) — training on clean input → clean target")
+        print("Recipe 1A: OFF (--no-degrade) — training on clean input → clean target")
     if start_step > 0:
         print(f"Resuming at step {start_step}")
     print()
@@ -790,10 +788,6 @@ def train(
             other_crepe  = batch['other_crepe'].to(dev)
             target_pitched = batch['target_pitched'].to(dev)      # (B,)
             other_pitched  = batch['other_pitched'].to(dev)       # (B, K)
-            B = target.shape[0]
-            # FIX: use 1 + L/hop to match torch.stft(center=True), NOT (L-n_fft)//hop+1
-            T_frames = 1 + target.shape[-1] // cfg.hop_length
-
             current_phase = (1 if step < PHASE_1_END
                              else 2 if step < PHASE_2_END
                              else 3)
@@ -903,7 +897,7 @@ def train(
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         save_checkpoint(step, loss.item(), is_best=True)
-                        print(f"  ✓ new best val loss — saved best.pt")
+                        print("  ✓ new best val loss — saved best.pt")
                         plateau_count = 0
                     else:
                         plateau_count += 1

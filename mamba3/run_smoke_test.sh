@@ -15,7 +15,7 @@ VENV_ACTIVATE="${SCRIPT_DIR}/.venv/bin/activate"
 # 1. Check for virtual environment
 if [ ! -f "${VENV_ACTIVATE}" ]; then
     echo "ERROR: Virtual environment not found at ${SCRIPT_DIR}/.venv"
-    echo "Please run './setup_env.sh' first to set up the environment."
+    echo "Run ./setup_env.sh first (see TRAINING_UBUNTU.md)."
     exit 1
 fi
 

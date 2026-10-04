@@ -1,0 +1,10 @@
+# Normalise line endings in the repo; keep shell scripts LF so they run on
+# Linux/RunPod even when cloned from Windows (core.autocrlf=true would
+# otherwise turn `#!/usr/bin/env bash` scripts into CRLF and break them).
+* text=auto
+*.sh   text eol=lf
+*.py   text eol=lf
+*.ps1  text
+*.onnx binary
+*.png  binary
+*.pt   binary

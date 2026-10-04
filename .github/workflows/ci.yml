@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  python-cpu:
+    name: Lint + smoke tests (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CPU PyTorch + deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy soundfile auraloss ruff
+          pip install -r mamba3/edge_dsp_meta_prompt/compiler/requirements.txt
+
+      - name: Lint (ruff, pyflakes rules only)
+        run: ruff check .
+
+      - name: Smoke test (full)
+        working-directory: mamba3
+        run: python smoke_test.py --device cpu
+
+      - name: Smoke test (reduced)
+        working-directory: mamba3
+        run: python test_smoke.py --device cpu
+
+      - name: Edge controller regression tests (incl. ONNX export round-trip)
+        working-directory: mamba3/edge_dsp_meta_prompt/compiler
+        run: python test_controller.py
+
+      - name: train.py micro-run (synthetic 4-track dataset, 4 optimizer steps)
+        working-directory: mamba3
+        run: |
+          python - <<'PY'
+          import numpy as np, soundfile as sf, os
+          sr = 44100
+          for i in range(4):
+              d = f"/tmp/ds/train/track_{i}"; os.makedirs(d, exist_ok=True)
+              t = np.arange(sr * 2) / sr
+              for j, s in enumerate(['bass', 'drums', 'vocals', 'other']):
+                  sf.write(f"{d}/{s}.wav", (0.3 * np.sin(2 * np.pi * (110 * (i + 1) + 70 * j) * t)).astype('float32'), sr)
+          PY
+          python train.py --data /tmp/ds/train --save /tmp/ck --device cpu --batch 2 --steps 4 \
+            --val-every 2 --ckpt-every 2 --log-every 1 --num-workers 0 --d-model 64 --n-layers 1 --val-split 0.25
+          test -f /tmp/ck/final.pt && test -f /tmp/ck/best.pt
+
+  rust-check:
+    name: Rust workspace (cargo check) — advisory
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The review that added this job had no Rust toolchain available, so the
+    # workspace has never been compiled in CI. Advisory until the first green
+    # run; then drop `continue-on-error` and add `cargo test -p edge_dsp_core`.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System deps for nih-plug
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgl-dev libjack-jackd2-dev libx11-xcb-dev libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mamba3/edge_dsp_meta_prompt
+      - name: cargo check (all workspace members)
+        working-directory: mamba3/edge_dsp_meta_prompt
+        run: cargo check --workspace --all-targets
+      - name: cargo test (RT core crate)
+        working-directory: mamba3/edge_dsp_meta_prompt
+        run: cargo test -p edge_dsp_core
+      - name: Upload Cargo.lock (commit it once this job is green)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cargo.lock
+          path: mamba3/edge_dsp_meta_prompt/Cargo.lock

@@ -236,12 +236,24 @@ class Mamba3StepLayer(nn.Module):
             nn.init.zeros_(m.weight)
             nn.init.zeros_(m.bias)
 
-    def step(self, u: Tensor, session: Tensor, h: Tensor) -> tuple[Tensor, Tensor]:
+    def step_real(self, u: Tensor, session: Tensor, h_re: Tensor, h_im: Tensor
+                  ) -> tuple[Tensor, Tensor, Tensor]:
         """
-        u:       (B, d_model) — this step's features
-        session: (B, 16)
-        h:       (B, H, N) complex64 — layer state
-        returns: (out (B, d_model), h_next (B, H, N) complex64)
+        One recurrent step in REAL arithmetic (ONNX has no complex dtype, and
+        both torch.onnx exporters reject ``aten::complex`` — this is the graph
+        that `export_onnx` traces).
+
+        u:            (B, d_model) — this step's features
+        session:      (B, 16)
+        h_re, h_im:   (B, H, N) — real / imaginary parts of the layer state
+        returns:      (out (B, d_model), h_re_next, h_im_next)
+
+        Math (identical to the complex form, bilinear/trapezoidal discretization
+        of the complex pole a + jω with step dt):
+            half = dt·(a + jω)/2
+            A_d  = (1 + half) / (1 − half)
+            B_d  = dt / (1 − half)
+            h'   = A_d·h + B_d·b
         """
         cfg = self.cfg
         residual = u
@@ -254,24 +266,50 @@ class Mamba3StepLayer(nn.Module):
         dt_raw = dt_raw * (1.0 + dg) + db
         dt = F.softplus(dt_raw + self.dt_bias).clamp(cfg.dt_min, cfg.dt_max)  # (B, H)
 
-        # Trits in fp32 for complex arithmetic stability
+        # fp32 for pole arithmetic stability
         with torch.autocast(device_type=u.device.type, enabled=False):
             dt = dt.float()
-            a_cont = torch.complex(-torch.exp(self.log_a_real.float()), self.a_imag.float())  # (H,)
-            half = dt.unsqueeze(-1) * a_cont / 2.0                        # (B, H) complex
-            A_d = (1.0 + half) / (1.0 - half)                             # (B, H) complex
-            B_d = dt.to(torch.complex64) / (1.0 - half)                   # (B, H) complex
+            a_re = -torch.exp(self.log_a_real.float())                    # (H,)  α < 0
+            a_im = self.a_imag.float()                                    # (H,)  ω
+            # half = dt·(a + jω)/2  → (B, H) real × (H,) → (B, H)
+            hr = dt * a_re / 2.0
+            hi = dt * a_im / 2.0
+            den = (1.0 - hr).pow(2) + hi.pow(2)                           # |1 − half|²
+            # A_d = (1 + half)/(1 − half)
+            A_re = (1.0 - hr.pow(2) - hi.pow(2)) / den
+            A_im = (2.0 * hi) / den
+            # B_d = dt/(1 − half)
+            B_re = dt * (1.0 - hr) / den
+            B_im = dt * hi / den
 
             bc = self.B_proj(u.float())                                   # (B, H*N*2)
             br, bi = bc.chunk(2, dim=-1)
-            b_vec = torch.complex(br, bi).reshape(-1, self.H, self.N)     # (B, H, N)
+            b_re = br.reshape(-1, self.H, self.N)                         # (B, H, N)
+            b_im = bi.reshape(-1, self.H, self.N)
 
-            h = A_d.unsqueeze(-1) * h + B_d.unsqueeze(-1) * b_vec         # (B, H, N)
-            h_cat = torch.cat([h.real, h.imag], dim=-1).reshape(-1, self.H * self.N * 2)
+            A_re = A_re.unsqueeze(-1); A_im = A_im.unsqueeze(-1)
+            B_re = B_re.unsqueeze(-1); B_im = B_im.unsqueeze(-1)
+            h_re_f = h_re.float()
+            h_im_f = h_im.float()
+            # complex multiply-accumulate, written out
+            h_re_n = A_re * h_re_f - A_im * h_im_f + B_re * b_re - B_im * b_im
+            h_im_n = A_re * h_im_f + A_im * h_re_f + B_re * b_im + B_im * b_re
+
+            h_cat = torch.cat([h_re_n.reshape(-1, self.H * self.N),
+                               h_im_n.reshape(-1, self.H * self.N)], dim=-1)
             y = self.C_proj(h_cat)                                        # (B, d_model)
 
         out = self.out_proj(y.to(residual.dtype))
-        return self.norm(out + residual), h
+        return self.norm(out + residual), h_re_n, h_im_n
+
+    def step(self, u: Tensor, session: Tensor, h: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        Complex-state convenience wrapper around `step_real`.
+        u: (B, d_model); session: (B, 16); h: (B, H, N) complex64
+        returns: (out (B, d_model), h_next (B, H, N) complex64)
+        """
+        out, h_re, h_im = self.step_real(u, session, h.real, h.imag)
+        return out, torch.complex(h_re, h_im)
 
 
 class Mamba3Controller(nn.Module):
@@ -296,10 +334,16 @@ class Mamba3Controller(nn.Module):
         return torch.zeros(batch, c.n_layers, c.n_heads, c.d_state,
                            dtype=torch.complex64, device=device)
 
+    # Packed-state layout (per layer, 64 real floats):
+    #     [ real(H*N) | imag(H*N) ]   with (H, N) row-major inside each half.
+    # `_flat_hidden`, `_unflat_hidden` and `forward_step` MUST all use this
+    # layout — the hidden state round-trips through the ONNX boundary every
+    # tick, so any mismatch scrambles the recurrence.
     def _flat_hidden(self, h: Tensor) -> Tensor:
         """(B, L, H, N) complex → (B, L, H*N*2) real  (= (B, L, 64))."""
         B, L, H, N = h.shape
-        return torch.cat([h.real, h.imag], dim=-1).reshape(B, L, H * N * 2)
+        return torch.cat([h.real.reshape(B, L, H * N),
+                          h.imag.reshape(B, L, H * N)], dim=-1)
 
     def _unflat_hidden(self, hf: Tensor) -> Tensor:
         """(B, L, 64) real → (B, L, H, N) complex."""
@@ -310,19 +354,27 @@ class Mamba3Controller(nn.Module):
         return torch.complex(hr, hi).reshape(B, L, c.n_heads, c.d_state)
 
     def forward_step(self, obs: Tensor, session: Tensor, hidden_state_in: Tensor) -> tuple[Tensor, Tensor]:
-        """One step. obs: (B, 1, 12); session: (B, 16); state: (B, 3, 64)."""
+        """One step. obs: (B, 1, 12); session: (B, 16); state: (B, 3, 64).
+
+        This is the exported ONNX graph: it stays entirely in real arithmetic
+        and uses the packed [real(H*N) | imag(H*N)] layout per layer (see
+        `_flat_hidden` / `_unflat_hidden`).
+        """
+        c = self.cfg
+        B = obs.shape[0]
+        half = c.n_heads * c.d_state
         u = self.in_proj(obs[:, 0, :]) + self.sess_bias(session)   # (B, d)
         u = F.silu(u)
-        h_list = []
-        h_states = self._unflat_hidden(hidden_state_in)            # (B, L, H, N)
+        h_out_list = []
         for l, layer in enumerate(self.layers):
-            u, h_next = layer.step(u, session, h_states[:, l])
-            h_list.append(h_next)
+            h_l = hidden_state_in[:, l, :]                          # (B, 64)
+            h_re = h_l[:, :half].reshape(B, c.n_heads, c.d_state)
+            h_im = h_l[:, half:].reshape(B, c.n_heads, c.d_state)
+            u, h_re, h_im = layer.step_real(u, session, h_re, h_im)
+            h_out_list.append(torch.cat([h_re.reshape(B, half),
+                                         h_im.reshape(B, half)], dim=-1))
         params = torch.tanh(self.param_head(u))                    # (B, 32)
-        h_out = torch.stack(
-            [torch.cat([h.real, h.imag], dim=-1).reshape(h.shape[0], -1) for h in h_list],
-            dim=1,
-        )  # (B, 3, 64)
+        h_out = torch.stack(h_out_list, dim=1)                     # (B, 3, 64)
         return params, h_out
 
     def forward(self, obs_seq: Tensor, session: Tensor,
@@ -429,8 +481,7 @@ def export_onnx(model: Mamba3Controller, path: str) -> None:
 
     wrapper = ExportWrapper(model).eval()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(
-        wrapper, (obs, sess, h), path,
+    export_kwargs = dict(
         input_names=['observer_features', 'session_state', 'hidden_state_in'],
         output_names=['dsp_parameters', 'hidden_state_out'],
         dynamic_axes={
@@ -442,6 +493,16 @@ def export_onnx(model: Mamba3Controller, path: str) -> None:
         },
         opset_version=17,
     )
+    # torch >= 2.9 defaults to the dynamo exporter, which (as of torch 2.14)
+    # writes weights to a side-car `<path>.data` file (breaks the plugin's
+    # single-file `include_bytes!` embedding) and emitted an opset-18
+    # `Split(num_outputs)` node under a declared opset 17 (onnxruntime refuses
+    # to load it).  The TorchScript exporter handles this small real-valued
+    # graph correctly, so request it explicitly where the kwarg exists.
+    import inspect
+    if 'dynamo' in inspect.signature(torch.onnx.export).parameters:
+        export_kwargs['dynamo'] = False
+    torch.onnx.export(wrapper, (obs, sess, h), path, **export_kwargs)
     print(f"Exported ONNX → {path}")
     print("  inputs : observer_features (B,1,12), session_state (B,16), hidden_state_in (B,3,64)")
     print("  outputs: dsp_parameters (B,32), hidden_state_out (B,3,64)")

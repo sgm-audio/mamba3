@@ -11,7 +11,9 @@ ssh root@<RUNPOD_SSH_HOST> -p <RUNPOD_SSH_PORT> -i ~/.ssh/<your_key>
 
 ```bash
 # Option A: git clone
-git clone https://github.com/you/mamba3.git /workspace/mamba3 && cd /workspace/mamba3
+git clone https://github.com/sgm-audio/mamba3.git /workspace/mamba3_repo
+ln -s /workspace/mamba3_repo/mamba3 /workspace/mamba3   # train.py lives in the mamba3/ sub-dir; keep later steps' paths valid
+cd /workspace/mamba3
 
 # Option B: scp from local machine (run on YOUR machine, not the pod)
 scp -P <PORT> -i <key> -r C:\Dev\mamba3\mamba3 root@<host>:/workspace/mamba3
@@ -131,8 +133,14 @@ python mamba3/edge_dsp_meta_prompt/compiler/fit_profile.py \
 
 # 3. Copy the quantized model back into the plugin and rebuild:
 cp mamba3_controller_quant.onnx mamba3/edge_dsp_meta_prompt/mamba3_controller_quant.onnx
-cargo xtask bundle cynical-engineer --release   # on a machine with Rust
+cd mamba3/edge_dsp_meta_prompt && cargo xtask bundle edge_dsp_plugin --release   # on a machine with Rust → target/bundled/Cynical Engineer.clap
+# <!-- STATUS: research --> the Rust workspace has not yet been built in CI; first build still to be recorded
 ```
 
 `compiler/quantize.py` enforces the 3-input/2-output signature gate and an
 fp32↔int8 parity check, so a bad export can never reach the plugin worker.
+
+The export needs `onnx`, `onnxruntime` **and** `onnxscript` (torch ≥ 2.9 imports
+it even for the TorchScript exporter): `pip install -r mamba3/edge_dsp_meta_prompt/compiler/requirements.txt`.
+Run `python mamba3/edge_dsp_meta_prompt/compiler/test_controller.py` first — it
+checks the recurrence, the packed-state layout and an ONNX round-trip in a few seconds.

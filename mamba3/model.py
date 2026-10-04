@@ -182,6 +182,20 @@ class R8FeatureExtractor(nn.Module):
         centroid_hz = (weights * freqs).sum(dim=-1, keepdim=True)  # (B, T, 1)
         return torch.log(centroid_hz.clamp(min=1.0)) / self.log_max_freq
 
+    def extract_raw(self, waveform: Tensor, stft_mag_sq: Tensor) -> Tensor:
+        """
+        waveform:    (B, L)
+        stft_mag_sq: (B, T, F) — precomputed |STFT|^2
+
+        returns: (B, T, R=8) — raw structured features, BEFORE input_proj.
+        Used directly as the MIMO input coupling (x_r8) in Mamba3MIMOLayer.
+        """
+        band_energy  = self._soft_band_energy(stft_mag_sq)    # (B, T, 6)
+        T_frames = stft_mag_sq.shape[1]
+        transient    = self._transient_density(waveform, T_frames)  # (B, T, 1)
+        centroid     = self._spectral_centroid(stft_mag_sq)    # (B, T, 1)
+        return torch.cat([band_energy, transient, centroid], dim=-1)  # (B, T, 8)
+
     def forward(self, waveform: Tensor, stft_mag_sq: Tensor) -> Tensor:
         """
         waveform:    (B, L)
@@ -189,13 +203,7 @@ class R8FeatureExtractor(nn.Module):
 
         returns: (B, T, d_model)
         """
-        band_energy  = self._soft_band_energy(stft_mag_sq)    # (B, T, 6)
-        T_frames = stft_mag_sq.shape[1]
-        transient    = self._transient_density(waveform, T_frames)  # (B, T, 1)
-        centroid     = self._spectral_centroid(stft_mag_sq)    # (B, T, 1)
-
-        r8 = torch.cat([band_energy, transient, centroid], dim=-1)  # (B, T, 8)
-        return self.input_proj(r8)                                    # (B, T, d_model)
+        return self.input_proj(self.extract_raw(waveform, stft_mag_sq))
 
 
 # ---------------------------------------------------------------------------
@@ -841,9 +849,11 @@ class PerTrackProcessor(nn.Module):
         mag_sq, stft_in = self._compute_stft(waveform)
         T = mag_sq.shape[1]
 
-        r8  = self.r8_extractor(waveform, mag_sq)              # (B, T, d_model)
-        # raw r8 before proj (for MIMO input)
-        r8_raw = self._extract_r8_raw(waveform, mag_sq)        # (B, T, 8)
+        # Raw R=8 features (MIMO input coupling) + their d_model projection.
+        # Extract once and project — previously the band/transient/centroid
+        # math ran twice per forward (once inside r8_extractor(), once here).
+        r8_raw = self.r8_extractor.extract_raw(waveform, mag_sq)   # (B, T, 8)
+        r8     = self.r8_extractor.input_proj(r8_raw)              # (B, T, d_model)
         mel = self._compute_mel(mag_sq)                         # (B, T, n_mels)
 
         # --- Semantic encoding (per-frame) ---
@@ -893,13 +903,9 @@ class PerTrackProcessor(nn.Module):
         }
 
     def _extract_r8_raw(self, waveform: Tensor, mag_sq: Tensor) -> Tensor:
-        """Extract raw R=8 features (before d_model projection) for MIMO input."""
-        ext = self.r8_extractor
-        band_energy = ext._soft_band_energy(mag_sq)             # (B, T, 6)
-        T_frames = mag_sq.shape[1]
-        transient   = ext._transient_density(waveform, T_frames)  # (B, T, 1)
-        centroid    = ext._spectral_centroid(mag_sq)            # (B, T, 1)
-        return torch.cat([band_energy, transient, centroid], dim=-1)  # (B, T, 8)
+        """Raw R=8 features (before d_model projection) for MIMO input.
+        Thin alias kept for callers (train.py, smoke tests)."""
+        return self.r8_extractor.extract_raw(waveform, mag_sq)
 
     def waveform_from_stft(self, stft: Tensor) -> Tensor:
         """

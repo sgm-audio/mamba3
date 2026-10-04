@@ -1,4 +1,9 @@
+# Edge controller toolchain (compiler/): distill → export → quantize → fit profile
 torch>=2.0.0
+numpy>=1.22.0
+# ONNX export + INT8 quantization + signature/parity gates (quantize.py)
 onnx>=1.14.0
 onnxruntime>=1.15.0
-numpy>=1.22.0
+# Required by torch.onnx.export on torch >= 2.9 (imported even when the
+# TorchScript exporter is selected via dynamo=False)
+onnxscript>=0.1.0

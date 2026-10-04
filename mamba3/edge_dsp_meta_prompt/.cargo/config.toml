@@ -1,0 +1,4 @@
+[alias]
+# `cargo xtask bundle edge_dsp_plugin --release` → target/bundled/<name>.clap
+xtask = "run --package xtask --release --"
+xtask-debug = "run --package xtask --"
