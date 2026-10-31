@@ -23,6 +23,8 @@ ruff check .                                              # pyflakes-only lint (
 (cd mamba3/edge_dsp_meta_prompt/compiler && python test_controller.py)
 ```
 
+CI status (checked 2026-10-31 via the Actions API): all push and pull-request runs in the history (2026-10-04) ended as `startup_failure`; no run of the gates has completed, so these gates are not currently enforced by CI. The same four gates passed when run locally on 2026-10-31 (ruff clean; smoke_test 0 failures; test_smoke 10/10; test_controller 9/9).
+
 ## Training
 
 | Platform | Guide |
