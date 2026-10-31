@@ -1,7 +1,7 @@
 # Training / smoke-test dependencies for the Mamba-3 per-track processor.
 #
 # Install PyTorch FIRST from the index that matches your accelerator
-# (see TRAINING_WINDOWS.md for the ROCm gfx1152 wheels, runpod_guide.md for
+# (see docs/training/windows-rocm.md for the ROCm gfx1152 wheels, docs/training/runpod.md for
 # CUDA pods), then:  pip install -r requirements.txt
 torch>=2.1
 torchaudio>=2.1
