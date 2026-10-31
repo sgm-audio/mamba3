@@ -12,7 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_ACTIVATE="${SCRIPT_DIR}/.venv/bin/activate"
-DATASET_ROOT="${DATASET_ROOT:-/media/sgm/bazzite/home/SGM/datasets/musdb18hq}"
+DATASET_ROOT="${DATASET_ROOT:-./datasets/musdb18hq}"
 
 if [ ! -f "${VENV_ACTIVATE}" ]; then
     echo "ERROR: Virtual environment not found at ${SCRIPT_DIR}/.venv — run ./setup_env.sh first."
