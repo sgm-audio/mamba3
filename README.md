@@ -51,7 +51,7 @@ python fit_profile.py --data client_features/ --weights checkpoints/controller.p
 contract (regenerated 2026-10-04; details in [`mamba3/REFERENCE_THIS_SHIT.md`](mamba3/REFERENCE_THIS_SHIT.md) §2).
 
 Plugin build: `cd mamba3/edge_dsp_meta_prompt && cargo xtask bundle edge_dsp_plugin --release` (NIH-plug bundler, `xtask/`).
-The Rust crates are **not built in CI yet** (the review sandbox had no Rust toolchain) — the first successful `cargo build` still needs to be recorded; see the status note in the reference doc.
+The Rust crates are **not built in CI yet** (the review sandbox had no Rust toolchain) — the first successful `cargo build` still needs to be recorded; see the status note in the reference doc. A `cargo build --release` attempt on 2026-10-31 (Rust 1.97.1) failed during dependency resolution: `plugin/Cargo.toml` line 12 requests the nih_plug feature `assert_no_alloc`, and the pinned nih-plug revision does not expose that feature name.
 
 ## Repo conventions
 
