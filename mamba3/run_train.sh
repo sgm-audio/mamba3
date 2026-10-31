@@ -14,7 +14,7 @@ VENV_ACTIVATE="${SCRIPT_DIR}/.venv/bin/activate"
 
 # Native configuration defaults
 # Override with DATASET_DIR=/path/to/musdb18hq/train ./run_train.sh
-DEFAULT_DATASET_DIR="${DATASET_DIR:-/media/sgm/bazzite/home/SGM/datasets/musdb18hq/train}"
+DEFAULT_DATASET_DIR="${DATASET_DIR:-./datasets/musdb18hq/train}"
 DEFAULT_BATCH_SIZE=2       # Safer default for 16GB UMA compared to 24GB
 DEFAULT_CKPT_EVERY=1000
 DEFAULT_VAL_EVERY=2000
@@ -23,7 +23,7 @@ LOG_FILE="${SCRIPT_DIR}/train.log"
 # 1. Check for virtual environment
 if [ ! -f "${VENV_ACTIVATE}" ]; then
     echo "ERROR: Virtual environment not found at ${SCRIPT_DIR}/.venv"
-    echo "Run ./setup_env.sh first (see TRAINING_UBUNTU.md)."
+    echo "Run ./setup_env.sh first (see docs/training/ubuntu-rocm.md)."
     exit 1
 fi
 

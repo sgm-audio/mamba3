@@ -51,7 +51,7 @@ def quantize_dynamic(in_path: str, out_path: str, verify: bool = True) -> str:
 
 
 def verify_signature(path: str) -> None:
-    """Assert the 3-input / 2-output contract documented in REFERENCE_THIS_SHIT.md."""
+    """Assert the 3-input / 2-output contract documented in docs/edge-controller-reference.md."""
     try:
         import onnxruntime as ort
     except ImportError as e:

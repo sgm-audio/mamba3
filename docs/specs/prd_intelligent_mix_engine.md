@@ -1,6 +1,6 @@
 # PRD: The Intelligent Mix Engine (Concept B)
 
-**Status:** Spec baseline (restored 2026-10-04; referenced by REFERENCE_THIS_SHIT.md § docs index)
+**Status:** Spec baseline (restored 2026-10-04; referenced by docs/edge-controller-reference.md § docs index)
 **Owner:** sgm-audio
 **Related:** `ard_intelligent_mix_engine.md`, `prd_cynical_engineer.md` (Concept A), `../model.py` (PerTrackProcessor)
 

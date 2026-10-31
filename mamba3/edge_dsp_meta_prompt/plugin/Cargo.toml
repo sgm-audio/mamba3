@@ -9,12 +9,14 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 edge_dsp_core = { path = "../core" }
 # Pinned to a specific upstream commit (nih-plug has no crates.io release); bump deliberately.
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683", features = ["assert_no_alloc"] }
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683", default-features = false, features = ["assert_process_allocs"] }
+# default-features = false drops the vst3 feature (vst3-sys is GPLv3); only nih_export_clap! is used.
 # NOTE: the previously pinned ort 1.16.3 is YANKED on crates.io (unbuildable).
 # Updated to the current maintained line (ONNX Runtime 1.28 wrapper); the
 # worker targets the 2.0-rc session/value API. `load-dynamic` dlopens the ORT
 # shared library at runtime (ORT_DYLIB_PATH or a dylib shipped with the plugin).
-ort = { version = "2.0.0-rc.13", features = ["load-dynamic", "ndarray"] }
+# default-features = false avoids the download/TLS build deps (openssl-sys); exact pin because rc releases break API.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "ndarray"] }
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.114"
 lazy_static = "1.4.0"

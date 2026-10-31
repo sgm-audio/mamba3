@@ -1,6 +1,6 @@
 # ARD: The Cynical Engineer (Concept A)
 
-**Status:** Architecture baseline (restored 2026-10-04; referenced by REFERENCE_THIS_SHIT.md § docs index)
+**Status:** Architecture baseline (restored 2026-10-04; referenced by docs/edge-controller-reference.md § docs index)
 **Owner:** sgm-audio
 **Related:** `prd_cynical_engineer.md`, `../core/src/*`, `../plugin/src/*`, `../compiler/*`
 

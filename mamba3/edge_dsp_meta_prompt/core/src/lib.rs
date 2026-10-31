@@ -1,7 +1,7 @@
 //! `edge_dsp_core` — hard real-time DSP primitives for the Cynical Engineer plugin.
 //!
 //! Everything in this crate must obey the audio-thread contract (see
-//! REFERENCE_THIS_SHIT.md § "Hard RT Domain"):
+//! docs/edge-controller-reference.md § "Hard RT Domain"):
 //!   - zero heap allocation after construction
 //!   - no locks, no syscalls, no logging
 //!   - O(1) per sample, no unbounded loops
