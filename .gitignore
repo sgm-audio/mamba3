@@ -40,3 +40,12 @@ Thumbs.db
 
 # Git submodule (not a real submodule, just embedded)
 mamba3/Mamba\ Based/
+
+# --- sgm-audio cleanup ---
+datasets/
+checkpoints/
+*.pt
+*.log
+target/
+.venv/
+venvs/
