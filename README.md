@@ -23,6 +23,8 @@ ruff check .                                              # pyflakes-only lint (
 (cd mamba3/edge_dsp_meta_prompt/compiler && python test_controller.py)
 ```
 
+CI status (checked 2026-10-31 via the Actions API): all push and pull-request runs in the history (2026-10-04) ended as `startup_failure`; no run of the gates has completed, so these gates are not currently enforced by CI. The same four gates passed when run locally on 2026-10-31 (ruff clean; smoke_test 0 failures; test_smoke 10/10; test_controller 9/9).
+
 ## Training
 
 | Platform | Guide |
@@ -51,7 +53,7 @@ python fit_profile.py --data client_features/ --weights checkpoints/controller.p
 contract (regenerated 2026-10-04; details in [`mamba3/REFERENCE_THIS_SHIT.md`](mamba3/REFERENCE_THIS_SHIT.md) §2).
 
 Plugin build: `cd mamba3/edge_dsp_meta_prompt && cargo xtask bundle edge_dsp_plugin --release` (NIH-plug bundler, `xtask/`).
-The Rust crates are **not built in CI yet** (the review sandbox had no Rust toolchain) — the first successful `cargo build` still needs to be recorded; see the status note in the reference doc.
+The Rust crates are **not built in CI yet** (the review sandbox had no Rust toolchain) — the first successful `cargo build` still needs to be recorded; see the status note in the reference doc. A `cargo build --release` attempt on 2026-10-31 (Rust 1.97.1) failed during dependency resolution: `plugin/Cargo.toml` line 12 requests the nih_plug feature `assert_no_alloc`, and the pinned nih-plug revision does not expose that feature name.
 
 ## Repo conventions
 
