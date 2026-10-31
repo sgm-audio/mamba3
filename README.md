@@ -26,7 +26,7 @@ pip install torch torchaudio            # pick the index for your accelerator
 pip install numpy soundfile auraloss ruff
 pip install -r mamba3/requirements.txt
 pip install -r mamba3/edge_dsp_meta_prompt/compiler/requirements.txt
-scripts/ci.sh            # add --rust to also run cargo check / cargo test (known failures, below)
+bash scripts/ci.sh       # add --rust to also run cargo check / cargo test (known failures, below)
 ```
 
 `scripts/ci.sh` runs ruff (pyflakes rules only), `smoke_test.py`,
