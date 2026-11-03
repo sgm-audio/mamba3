@@ -66,8 +66,8 @@ impl Observer {
         }
 
         // Pre-compute log-spaced triangular bands (from ~30 Hz to ~16 kHz)
-        let f_min = 30.0;
-        let f_max = 16000.0;
+        let f_min: f32 = 30.0;
+        let f_max: f32 = 16000.0;
         let num_bands = 6;
         
         let mel_min = 1127.0 * (1.0 + f_min / 700.0).ln();
