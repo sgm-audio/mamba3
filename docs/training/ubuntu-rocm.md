@@ -9,10 +9,9 @@
 
 ## 1. Native Workspace & Dataset Paths
 
-All native helper scripts are configured to use your mounted drives directly:
-* **Active Project Workspace**: `/home/sgm/Desktop/mamba3`
-* **Original Bazzite Backup**: `/media/sgm/bazzite/home/SGM/mamba3`
-* **Raw MUSDB18-HQ Dataset**: `/media/sgm/bazzite/home/SGM/datasets/musdb18hq`
+The helper scripts read two environment variables:
+* `DATASET_DIR`: the MUSDB18-HQ `train/` folder (default `./datasets/musdb18hq/train`), used by `run_train.sh`
+* `DATASET_ROOT`: the MUSDB18-HQ root (default `./datasets/musdb18hq`), used by `extract_f0.sh`
 
 ---
 
@@ -98,7 +97,7 @@ Sustained training on laptops demands vigilance regarding temperatures to preven
 
 ### "HIP error: invalid device function"
 * **Reason**: ROCm environment variables were lost or not loaded.
-* **Solution**: Always launch using our `./run_train.sh` or `./run_smoke_test.sh` scripts, which force-export `HSA_OVERRIDE_GFX_VERSION=11.0.0`, `PYTORCH_ROCM_ARCH=gfx1100`, and `HSA_ENABLE_SDMA=0` before running Python (these are the values the scripts actually set; they match `TRAINING.md` §1.3).
+* **Solution**: Always launch using our `./run_train.sh` or `./run_smoke_test.sh` scripts, which force-export `HSA_OVERRIDE_GFX_VERSION=11.0.0`, `PYTORCH_ROCM_ARCH=gfx1100`, and `HSA_ENABLE_SDMA=0` before running Python (these are the values the scripts actually set; they match `docs/training/bazzite-distrobox-rocm.md` §1.3).
 
 ### iGPU Not Visible to PyTorch (`CUDA/ROCm Available: False` / running CPU-only)
 * **Reason**: On AMD APUs (Ryzen laptops with integrated Radeon 860M graphics), the KFD (Kernel Fusion Driver) interface must be enabled, display memory pinning conflicts resolved, IOMMU isolated, and system user groups verified.

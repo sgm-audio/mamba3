@@ -2,7 +2,7 @@ import numpy as np
 
 # 6C: Fixed 8-D customer/tone profile embedding, carried in session_state[8:16].
 # Learned per customer via prompt-tuning (fit_profile.py) with ALL model weights
-# frozen — see REFERENCE_THIS_SHIT.md § "Customer Profile Prompt-Tuning (6C)".
+# frozen — see docs/edge-controller-reference.md § "Customer Profile Prompt-Tuning (6C)".
 PROFILE_DIM = 8
 
 class PromptStack:

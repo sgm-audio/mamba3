@@ -60,9 +60,9 @@ jobs:
     name: Rust workspace (cargo check) — advisory
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # The review that added this job had no Rust toolchain available, so the
-    # workspace has never been compiled in CI. Advisory until the first green
-    # run; then drop `continue-on-error` and add `cargo test -p edge_dsp_core`.
+    # Advisory: on 2026-10-31 (Rust 1.97.1) edge_dsp_plugin fails with 26
+    # errors and edge_dsp_core tests are 8 pass / 3 fail. Drop
+    # continue-on-error once both are green.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4

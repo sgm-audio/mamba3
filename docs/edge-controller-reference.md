@@ -1,8 +1,10 @@
-# MASTER REFERENCE GUIDE: Edge-Inference DSP Meta-Prompt Stack & CLAP Plugin Framework
+# Edge controller and CLAP plugin: reference notes
 
 This document serves as the quick-reference for the **Edge-Inference DSP Meta-Prompt Stack** and **CLAP Plugin Framework** codebase under `mamba3/edge_dsp_meta_prompt/` (paths below are relative to that directory).
 
 <!-- STATUS: in progress -->
+> **Status (2026-10-31):** the Rust workspace still does not build. After fixing the nih_plug feature name, the `ort` features and two untyped float literals in `core/src/observer.rs`, `cargo check` stops at 26 API errors in `plugin/` (written against nih-plug/ort APIs that don't match the pinned versions). `cargo test -p edge_dsp_core`: 8 pass, 3 fail. Details: the repo README.
+>
 > **Status (review 2026-10-04):** the Python toolchain (`compiler/`) is runnable and tested; the Rust crates have **not yet been compiled anywhere on record** (the review sandbox had no Rust toolchain). `nih_plug` is now pinned to a commit, an `xtask` bundler crate was added, and CI runs an advisory `cargo check` — commit the `Cargo.lock` it produces once green. `ort` is still a 2.0 release candidate. Treat the Rust side as unverified until that job passes.
 
 ---
@@ -138,7 +140,7 @@ All compilation, model training simulations, and dynamic quantization passes mus
 
 ---
 
-## 5. TODO'S FOR NEXT SESSION (After Model Training Completes)
+## 5. Workflow after training (not yet done end to end)
 
 Once you complete training the `Mamba3Controller` model on your specific datasets, follow this step-by-step roadmap to integrate and deploy the plugin:
 
@@ -162,7 +164,7 @@ Once you complete training the `Mamba3Controller` model on your specific dataset
     ```
 
 ### 🟩 Step 3: Integrate ONNX Model inside the CLAP Crate
-1.  Open [plugin/src/worker.rs](file:///home/sgm/Desktop/mamba3/edge_dsp_meta_prompt/plugin/src/worker.rs).
+1.  Open [plugin/src/worker.rs](../mamba3/edge_dsp_meta_prompt/plugin/src/worker.rs).
 2.  Locate the model load line inside `spawn()` and ensure the path points to the assets folder copy:
     ```rust
     let session = Session::builder()
